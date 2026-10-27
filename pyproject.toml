@@ -1,0 +1,32 @@
+[project]
+name = "ddg"
+version = "0.1.0"
+description = "Iterative tabular data discovery with SME review, graph-builder code generation, and a graph visualizer"
+authors = [
+    { name = "Maho Pacheco", email = "mapach@microsoft.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "agent-framework-core>=1.22.0",
+    "agent-framework-foundry>=1.15.0",
+    "azure-identity>=1.27.0",
+    "fastapi>=0.156.2",
+    "python-dotenv>=1.2.4",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+ddg = "ddg.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.9,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

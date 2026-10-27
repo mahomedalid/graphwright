@@ -1,0 +1,7 @@
+I want to create a data-discovery agent, this should run as an automated agent, I also want a UI. This is the scenario.
+
+Companies would have data mess, lots of tables, etc. I want to have an agent that navigate thru those tables, columns, metadata, some rows, iterative, and try to find facts and candidates to facts to relate those data pooints. The goal is to create a graph.
+
+In order to do that there is going to be a graph topology in the facts folder (type of nodes, type of edges, some specifics of it, types of relationships we know), then the agent would use either sqlite (for local development) or databricks cli (this is first phase for actual production data) to start retrieving schemas, metadata, columns etc. and will put candidate insights, or candidate facts, or that thing in somewhere (json for now) that a SME will review in a UI/UI and approve or reject with notes and observations. This would go to facts or other folder, and the agent will continue doing it. The agent should be invoked manually and run automatically for as many minutes as it needs to find facts and do another iteration (using Azure Foundry, and using Mcirosoft Agentic Framework or something from Micrcosoft).
+
+IT should also create code to build the graph FROM the tabular tables. Will also have a visualizer of such graph in the UI.

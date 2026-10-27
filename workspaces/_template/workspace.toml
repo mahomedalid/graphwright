@@ -1,0 +1,28 @@
+[workspace]
+description = ""
+
+# Add one or more sources. Paths are relative to this workspace folder.
+#
+# [sources.local]
+# type = "sqlite"
+# path = "data/my.sqlite"
+#
+# [sources.prod]
+# type = "databricks"
+# profile = "DEFAULT"              # databricks CLI profile
+# warehouse_id = "<sql-warehouse-id>"
+# catalog = "<catalog>"
+# schema = "<schema>"
+
+[sampling]
+# Raw values may only be returned (and sent to Foundry) for allowlisted table.column globs,
+# for example ["ref_*.*", "*.category"]. Everything else exposes counts and value shapes only.
+allowlist = []
+
+# Optional overrides of ddg.toml defaults:
+# [run]
+# max_minutes = 10
+# max_cost_usd = 2.0
+#
+# [agent]
+# planner = "auto"   # auto | foundry | heuristic

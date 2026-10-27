@@ -1,0 +1,15 @@
+{
+  "description": "Ground truth for the retail fixture, used to evaluate discovery quality (true mappings, plus decoys that must not be proposed first).",
+  "nodes": {
+    "Customer": {"source_table": "CUST_MASTER", "key_columns": ["cust_id"]},
+    "Order": {"source_table": "tbl_ord_hdr", "key_columns": ["order_no"]},
+    "Product": {"source_table": "prod_catalog", "key_columns": ["SKU"]},
+    "Store": {"source_table": "stores_ref", "key_columns": ["store_code"]}
+  },
+  "edges": {
+    "PLACED": {"source_table": "tbl_ord_hdr", "from_key_columns": ["cust_ref"], "to_key_columns": ["order_no"]},
+    "CONTAINS": {"source_table": "ord_lines_v2", "from_key_columns": ["order_no"], "to_key_columns": ["sku"]},
+    "SOLD_AT": {"source_table": "tbl_ord_hdr", "from_key_columns": ["order_no"], "to_key_columns": ["store_cd"]}
+  },
+  "decoys": ["cust_master_bak", "audit_log", "tmp_export_2019"]
+}

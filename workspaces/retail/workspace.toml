@@ -1,0 +1,15 @@
+[workspace]
+description = "Synthetic retail sample: messy names, implicit joins, decoy tables"
+
+# Paths are relative to this workspace folder. Build the database with: uv run ddg init-sample
+[sources.retail]
+type = "sqlite"
+path = "data/retail.sqlite"
+
+[sampling]
+# Raw values may only be returned (and sent to Foundry) for allowlisted table.column globs.
+allowlist = ["prod_catalog.*", "stores_ref.*", "*.city_txt", "*.category"]
+
+# Optional overrides of ddg.toml defaults:
+# [run]
+# max_minutes = 5

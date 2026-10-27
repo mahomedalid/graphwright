@@ -1,0 +1,31 @@
+# Data Discovery Graph: global defaults.
+# Each workspace (workspaces/<name>/workspace.toml) holds its own sources and sampling
+# allowlist and may override [run] and [agent] values below.
+
+[workspaces]
+dir = "workspaces"
+# Used when neither --workspace, DDG_WORKSPACE, nor workspaces/.active (set by `ddg workspace use`) picks one.
+default = "retail"
+
+[agent]
+# auto = Foundry when FOUNDRY_PROJECT_ENDPOINT and FOUNDRY_MODEL are set, otherwise the offline heuristic planner
+planner = "auto"
+
+[run]
+max_minutes = 10
+max_iterations = 20
+max_model_calls = 60
+max_tool_calls = 400
+max_cost_usd = 2.0
+stall_iterations = 2
+query_timeout_seconds = 30
+max_join_keys = 200000
+
+[sampling]
+max_rows = 10
+max_top_values = 5
+
+[model]
+input_cost_per_1k = 0.0025
+output_cost_per_1k = 0.01
+max_tool_calls_per_iteration = 25

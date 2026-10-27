@@ -1,0 +1,25 @@
+.copilot-tracking
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local secrets and test caches
+.env
+.pytest_cache/
+
+# Runtime artifacts produced inside each workspace
+workspaces/.active
+workspaces/*/runs/
+workspaces/*/candidates/
+workspaces/*/facts/
+workspaces/*/metadata/
+workspaces/*/sandbox/
+workspaces/*/graph_output/
+workspaces/*/data/*.sqlite

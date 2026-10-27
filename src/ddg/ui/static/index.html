@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Data Discovery Graph</title>
+  <link rel="stylesheet" href="/static/style.css?v=__ASSET_VERSION__">
+  <script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js" defer></script>
+  <script src="/static/app.js?v=__ASSET_VERSION__" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Data Discovery Graph</h1>
+    <div class="workspace-picker">
+      <label for="workspace-select" class="ws-label">Workspace</label>
+      <select id="workspace-select" aria-describedby="workspace-info"></select>
+      <button id="new-workspace-btn" type="button" title="Create a workspace">+ New</button>
+    </div>
+    <nav aria-label="Main">
+      <ul role="tablist" id="tabs">
+        <li><button role="tab" data-tab="runs" aria-selected="true">Runs</button></li>
+        <li><button role="tab" data-tab="review" aria-selected="false">Review <span id="pending-badge" class="badge" aria-label="pending candidates"></span></button></li>
+        <li><button role="tab" data-tab="facts" aria-selected="false">Facts &amp; Code</button></li>
+        <li><button role="tab" data-tab="graph" aria-selected="false">Graph</button></li>
+        <li><button role="tab" data-tab="topology" aria-selected="false">Topology &amp; Metadata</button></li>
+      </ul>
+    </nav>
+    <div id="status-line" class="muted" aria-live="polite"></div>
+  </header>
+  <div id="workspace-info" class="workspace-info" aria-live="polite"></div>
+
+  <dialog id="new-workspace-dialog" aria-labelledby="new-ws-title">
+    <form id="new-ws-form">
+      <h2 id="new-ws-title">New workspace</h2>
+      <label>Name <input id="new-ws-name" name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,63}" title="Letters, digits, - or _; must not start with - or _"></label>
+      <label>Description <input name="description" maxlength="500"></label>
+      <label>Start from <select id="new-ws-from" name="copy_from"></select></label>
+      <p class="muted small">Only workspace.toml and topology.md are copied. Runs, candidates, and facts start empty.</p>
+      <p id="new-ws-error" class="error" role="alert"></p>
+      <div class="row">
+        <button type="submit" class="primary">Create</button>
+        <button type="button" id="new-ws-cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" role="status" aria-live="polite" class="toast hidden"></div>
+
+  <main>
+    <!-- Runs -->
+    <section id="tab-runs" role="tabpanel" class="tab">
+      <div id="no-sources" class="card warn hidden">
+        This workspace has no data sources. Add a <code>[sources.&lt;name&gt;]</code> section to
+        <code id="no-sources-path"></code>, then reload.
+      </div>
+      <div class="grid two">
+        <form id="run-form" class="card" aria-labelledby="run-form-title">
+          <h2 id="run-form-title">Start a discovery run</h2>
+          <label>Source <select name="source" id="run-source" required></select></label>
+          <label>Planner
+            <select name="planner">
+              <option value="">Default (auto)</option>
+              <option value="foundry">Foundry agent</option>
+              <option value="heuristic">Offline heuristic</option>
+            </select>
+          </label>
+          <div class="row">
+            <label>Max minutes <input name="max_minutes" type="number" min="0.1" step="0.1"></label>
+            <label>Max iterations <input name="max_iterations" type="number" min="1"></label>
+            <label>Max cost (USD) <input name="max_cost_usd" type="number" min="0" step="0.1"></label>
+          </div>
+          <p class="muted small">Blank limits use the workspace defaults (workspace.toml, then ddg.toml). The run continues autonomously until a limit, a stall, or cancellation.</p>
+          <button type="submit" class="primary">Start run</button>
+        </form>
+        <div class="card">
+          <h2>Runs</h2>
+          <div class="table-wrap">
+            <table id="runs-table">
+              <thead><tr><th>Run</th><th>Status</th><th>Source</th><th>Planner</th><th>Iter.</th><th>New</th><th>Reason</th><th>Actions</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div id="run-detail" class="card hidden" aria-live="polite"></div>
+    </section>
+
+    <!-- Review -->
+    <section id="tab-review" role="tabpanel" class="tab hidden">
+      <div class="toolbar">
+        <label>Status
+          <select id="review-status">
+            <option value="pending">Pending</option>
+            <option value="approved">Approved</option>
+            <option value="rejected">Rejected</option>
+            <option value="">All</option>
+          </select>
+        </label>
+        <label>Reviewer <input id="reviewer" placeholder="Your name" autocomplete="name"></label>
+        <button id="review-refresh">Refresh</button>
+      </div>
+      <div class="grid review">
+        <div class="card list" id="candidate-list" aria-label="Candidates"></div>
+        <div class="card" id="candidate-detail"><p class="muted">Select a candidate to review its evidence.</p></div>
+      </div>
+    </section>
+
+    <!-- Facts -->
+    <section id="tab-facts" role="tabpanel" class="tab hidden">
+      <div class="toolbar">
+        <label>Source <select id="facts-source"></select></label>
+        <label class="inline"><input type="checkbox" id="allow-stale"> Include facts flagged for revalidation</label>
+        <button id="generate-btn" class="primary">Generate graph builder code</button>
+      </div>
+      <div class="grid two">
+        <div class="card">
+          <h2>Approved facts</h2>
+          <div id="revalidation"></div>
+          <div class="table-wrap"><table id="facts-table">
+            <thead><tr><th>Fact</th><th>Kind</th><th>Mapping</th><th>Approved by</th><th>Notes</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+        </div>
+        <div class="card">
+          <h2>Generated code</h2>
+          <p class="muted small">The product never runs generated code. Review it, then run the suggested command yourself; its JSON output appears in the Graph tab.</p>
+          <div id="codegen-result"></div>
+          <h3>Previous builders</h3>
+          <ul id="generated-list" class="plain"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- Graph -->
+    <section id="tab-graph" role="tabpanel" class="tab hidden">
+      <div class="toolbar">
+        <label>Graph file <select id="graph-file"></select></label>
+        <label>Search <input id="graph-q" placeholder="id or property value"></label>
+        <label>Type <select id="graph-type"><option value="">All types</option></select></label>
+        <label>Depth <select id="graph-depth"><option>1</option><option>2</option><option>3</option></select></label>
+        <button id="graph-search-btn">Search</button>
+        <button id="graph-clear-btn">Clear view</button>
+      </div>
+      <div id="graph-summary" class="muted small"></div>
+      <div class="grid graph">
+        <div class="card list" id="graph-results" aria-label="Search results"></div>
+        <div class="card graph-canvas-card">
+          <div id="cy" role="img" aria-label="Graph visualization; a text alternative follows"></div>
+        </div>
+        <div class="card" id="graph-detail"><p class="muted">Search, then select a node to load its neighborhood.</p></div>
+      </div>
+      <details class="card">
+        <summary>Text view of the displayed graph</summary>
+        <div id="graph-text"></div>
+      </details>
+    </section>
+
+    <!-- Topology -->
+    <section id="tab-topology" role="tabpanel" class="tab hidden">
+      <div class="grid two">
+        <div class="card" id="topology-view"></div>
+        <div class="card">
+          <h2>Source metadata</h2>
+          <label>Source <select id="meta-source"></select></label>
+          <div id="metadata-view"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
