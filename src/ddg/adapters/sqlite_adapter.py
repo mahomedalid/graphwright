@@ -13,8 +13,8 @@ class SQLiteAdapter(SourceAdapter):
     dialect = "sqlite"
     quote_char = '"'
 
-    def __init__(self, name: str, path: str | Path, query_timeout_seconds: int = 30):
-        super().__init__(name, query_timeout_seconds)
+    def __init__(self, name: str, path: str | Path, query_timeout_seconds: int = 30, table_patterns: list[str] | None = None):
+        super().__init__(name, query_timeout_seconds, table_patterns)
         self.path = Path(path).resolve()
         if not self.path.exists():
             raise FileNotFoundError(f"SQLite database not found: {self.path}")

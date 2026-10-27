@@ -43,7 +43,7 @@ def cmd_workspace(args) -> int:
     if action == "create":
         path = create_workspace(root, args.name, args.copy_from, args.description or "")
         print(f"Created workspace '{args.name}' at {path}")
-        print(f"Next: edit {path / 'topology.md'} and add a source to {path / 'workspace.toml'}")
+        print(f"Next: edit {load_settings(root, args.name).topology_file} and add a source to {path / 'workspace.toml'}")
         if args.use:
             set_active_workspace(root, args.name)
             print(f"Active workspace: {args.name}")
@@ -59,6 +59,40 @@ def cmd_workspace(args) -> int:
         print(json.dumps(describe_workspace(root, name), indent=2))
         return 0
     return 1
+
+
+def cmd_sources(args) -> int:
+    from .adapters import create_adapter
+
+    settings = _settings(args)
+    names = [args.source] if args.source else list(settings.sources)
+    if not names:
+        print(f"Workspace '{settings.workspace}' has no sources. Add one to {settings.workspace_dir / 'workspace.toml'}")
+        return 1
+    failures = 0
+    for name in names:
+        cfg = settings.source(name)
+        print(f"[{name}] type={cfg.type}")
+        adapter = None
+        try:
+            adapter = create_adapter(settings, cfg)
+            tables = adapter.tables()
+            print(f"  connected; {len(tables)} table(s) in scope")
+            for table in tables:
+                columns = adapter.columns(table)
+                print(f"  - {table} ({len(columns)} columns)")
+            missing = adapter.missing_scope_entries() if hasattr(adapter, "missing_scope_entries") else []
+            for entry in missing:
+                print(f"  ! not found or no access: {entry}")
+            if not tables or missing:
+                failures += 1
+        except Exception as exc:  # noqa: BLE001 - report every source
+            print(f"  FAILED: {exc}")
+            failures += 1
+        finally:
+            if adapter is not None:
+                adapter.close()
+    return 1 if failures else 0
 
 
 def cmd_topology(args) -> int:
@@ -215,6 +249,10 @@ def main(argv: list[str] | None = None) -> int:
     u.add_argument("name")
     s = ws_sub.add_parser("show", help="Show workspace details")
     s.add_argument("name", nargs="?")
+
+    p = add("sources", cmd_sources, "Check source connections and list tables in scope (no row values)")
+    p.add_argument("action", choices=["check"])
+    p.add_argument("--source", help="Check only this source")
 
     p = add("topology", cmd_topology, "Validate and print the workspace topology")
     p.add_argument("--json", action="store_true")

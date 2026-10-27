@@ -7,7 +7,8 @@ Layout::
       _template/                blank starter copied by ``ddg workspace create``
       <name>/
         workspace.toml          [sources.*], [sampling] allowlist, optional [run]/[agent] overrides
-        topology.md             user-authored graph topology
+        context/topology.md     user-authored graph topology (legacy: topology.md)
+        context/**/*.md         additional unverified reference material
         data/                   optional local data (e.g. SQLite files)
         candidates/ facts/ metadata/ runs/ sandbox/ graph_output/   runtime artifacts
 """
@@ -264,7 +265,9 @@ def load_settings(root: Path | None = None, workspace: str | None = None) -> Set
         sampling=sampling,
         model=model,
         sources=sources,
-        topology_file=ws_dir / ws.get("topology", {}).get("file", "topology.md"),
+        topology_file=ws_dir / ws.get("topology", {}).get(
+            "file", "context/topology.md" if (ws_dir / "context" / "topology.md").exists() else "topology.md"
+        ),
         planner=str(section("agent").get("planner", "auto")),
         api_token=_env("DDG_API_TOKEN"),
         description=str(ws.get("workspace", {}).get("description", "")),

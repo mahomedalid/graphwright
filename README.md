@@ -22,7 +22,7 @@ Open <http://127.0.0.1:8000> and select **Start run**.
 uv run ddg workspace create mydata --use
 ```
 
-This creates `workspaces/mydata/` with a blank `workspace.toml` and `topology.md`.
+This creates `workspaces/mydata/` with a blank `workspace.toml` and `context/topology.md`.
 
 ### 3. Add a data source
 
@@ -36,15 +36,22 @@ type = "sqlite"
 path = "data/my.sqlite"
 ```
 
-Databricks (requires the [Databricks CLI](https://docs.databricks.com/dev-tools/cli/) and `databricks auth login`):
+Databricks (see [Connecting Databricks](#connecting-databricks) for the full setup):
 
 ```toml
 [sources.prod]
 type = "databricks"
-profile = "DEFAULT"
+profile = "customer"
 warehouse_id = "<sql-warehouse-id>"
 catalog = "<catalog>"
 schema = "<schema>"
+tables = ["orders", "customers", "crm.accounts"]
+```
+
+Check the connection (lists tables in scope, never row values):
+
+```powershell
+uv run ddg sources check
 ```
 
 Optionally allow raw sample values for non-sensitive columns:
@@ -56,7 +63,7 @@ allowlist = ["products.*", "*.category"]
 
 ### 4. Describe your graph
 
-Edit `workspaces/mydata/topology.md`:
+Edit `workspaces/mydata/context/topology.md`:
 
 ```markdown
 ## Node Types
@@ -88,6 +95,23 @@ Check it:
 ```powershell
 uv run ddg topology
 ```
+
+Put additional Markdown references, such as data dictionaries or previous findings, in
+`workspaces/mydata/context/`. All `.md` files are read recursively, including subfolders;
+other file types are ignored. Only the configured topology file defines graph types.
+Additional documents are passed verbatim, with filenames, to the Foundry planner as
+unverified background material in every iteration. They do not become approved facts
+or executable instructions. The offline heuristic planner does not interpret them.
+
+Documents are loaded once at the start of each run; start a new run to pick up edits.
+The run record lists additional documents in `context_files`. Files must be UTF-8;
+unreadable files fail the run rather than being silently omitted.
+
+> [!WARNING]
+> Reference documents are sent to the configured model without the source-column
+> sampling filter. Include only content you are authorized to share with that model.
+> All reference text is included without truncation, so keep documents concise to
+> control token costs and avoid model context-limit errors.
 
 ### 5. Connect Microsoft Foundry (optional)
 
@@ -127,7 +151,7 @@ The implementation follows the [PRD](docs/prds/data-discovery-graph.md) "SQLite 
 Everything lives in a workspace: one self-contained folder per dataset or domain, with its own sources, topology, candidates, facts, runs, and graph output.
 
 ```text
-workspaces/<name>/topology.md ──► discovery run (Foundry agent or offline planner)
+workspace topology + context ──► discovery run (Foundry agent or offline planner)
                                      │ read-only, privacy-filtered tools
                                      ▼
                          candidates/*.json ──► SME review in UI ──► facts/*.json
@@ -145,7 +169,9 @@ ddg.toml                      global defaults: [run], [agent], [sampling], [mode
 workspaces/
   _template/                  blank starter copied by "New workspace"
     workspace.toml
-    topology.md
+    context/
+      topology.md             graph definition
+      notes.md                optional Markdown references, including subfolders
   retail/                     synthetic sample
     workspace.toml            sources, sampling allowlist, optional [run]/[agent] overrides
     topology.md               your business graph
@@ -161,12 +187,25 @@ workspaces/
 
 Source paths in `workspace.toml` are relative to the workspace folder. Values in `workspace.toml` override `ddg.toml`.
 
+New workspaces use `context/topology.md`. Existing root-level `topology.md` files
+remain supported. Without an explicit setting, `context/topology.md` takes precedence
+when present, otherwise the root-level file is used. To select a different topology:
+
+```toml
+[topology]
+file = "context/topology.md"
+```
+
+Additional references are always read from the workspace's `context/` folder, regardless
+of the topology location. The configured topology is excluded from those references
+because its parsed summary is already supplied separately.
+
 The active workspace is resolved in this order: `-w/--workspace`, `DDG_WORKSPACE`, `workspaces/.active` (set by `ddg workspace use` or by switching in the UI), then `[workspaces].default` in `ddg.toml`.
 
 ```powershell
 uv run ddg workspace list                              # * marks the active workspace
 uv run ddg workspace create sales --description "Sales pilot" --use
-uv run ddg workspace create retail-v2 --from retail     # copies workspace.toml and topology.md only
+uv run ddg workspace create retail-v2 --from retail     # copies config, topology, and context Markdown
 uv run ddg workspace use retail
 uv run ddg -w sales topology                            # any command accepts -w
 ```
@@ -223,18 +262,64 @@ Each iteration gives the agent the topology, the review snapshot (approved, pend
 
 ## Connecting Databricks
 
-Install and authenticate the [Databricks CLI](https://docs.databricks.com/dev-tools/cli/), then add a source to the workspace's `workspace.toml`:
+Discovery talks to Databricks only through the [Databricks CLI](https://docs.databricks.com/dev-tools/cli/), using the SQL Statement Execution API on a SQL warehouse. Authentication is whatever your CLI profile uses (OAuth sign-in, Azure CLI, or a token); no credentials are stored in this repository.
 
-```toml
-[sources.prod]
-type = "databricks"
-profile = "DEFAULT"
-warehouse_id = "<sql-warehouse-id>"
-catalog = "<catalog>"
-schema = "<schema>"
-```
+1. Install the CLI and sign in to the customer workspace:
 
-Statements run through the SQL Statement Execution API (`databricks api post /api/2.0/sql/statements`) with a wait timeout and `CANCEL` on timeout. Use a principal with read-only grants. Generated builders read Databricks through `databricks-sql-connector` using `DATABRICKS_SERVER_HOSTNAME`, `DATABRICKS_HTTP_PATH`, and `DATABRICKS_TOKEN`.
+   ```powershell
+   winget install Databricks.DatabricksCLI
+   databricks auth login --host https://adb-<id>.<n>.azuredatabricks.net --profile customer
+   databricks current-user me --profile customer
+   ```
+
+2. Find a SQL warehouse ID (a small serverless warehouse is enough):
+
+   ```powershell
+   databricks warehouses list --profile customer
+   ```
+
+3. Make sure the signed-in identity has read-only access: `CAN USE` on the warehouse, plus `USE CATALOG`, `USE SCHEMA`, and `SELECT` on the tables in scope. Ideally use an identity that has no write grants.
+
+4. Create a workspace and add the source with your initial set of tables:
+
+   ```powershell
+   uv run ddg workspace create customer --description "Customer pilot" --use
+   ```
+
+   ```toml
+   # workspaces/customer/workspace.toml
+   [sources.prod]
+   type = "databricks"
+   profile = "customer"
+   warehouse_id = "<sql-warehouse-id>"
+   catalog = "<catalog>"
+   schema = "sales"                                   # default schema for bare table names
+   tables = ["orders", "order_lines", "crm.accounts", "ref_*"]
+   query_timeout_seconds = 120
+   ```
+
+   `tables` limits discovery to these tables; anything else in the catalog cannot be described, sampled, or joined. Entries are `table` (in `schema`) or `schema.table`, and `*` globs work in the table part. Omit `tables` to scan the whole default schema. Tables from other schemas appear as `schema.table`.
+
+5. Check the connection and scope:
+
+   ```powershell
+   uv run ddg sources check
+   ```
+
+   It lists each table in scope with its column count and flags entries that do not exist or are not visible to you. No row values are read.
+
+6. Decide which columns may expose raw sample values to the agent (and to Foundry). Patterns match `table.column`, where `table` is the name shown by `sources check`:
+
+   ```toml
+   [sampling]
+   allowlist = ["ref_*.*", "orders.status", "crm.accounts.region"]
+   ```
+
+7. Write `topology.md`, then run discovery from the UI or with `uv run ddg run`.
+
+Each discovery query runs as a separate CLI call, so expect a second or two of overhead per query. Statements that exceed `query_timeout_seconds` are cancelled on the warehouse.
+
+Generated builders read Databricks through `databricks-sql-connector` (`pip install databricks-sql-connector`). Set `DATABRICKS_HOST`; the builder uses the discovery warehouse unless `DATABRICKS_HTTP_PATH` is set, and signs in with `DATABRICKS_TOKEN` when present or a browser OAuth flow otherwise.
 
 ## Topology Format
 

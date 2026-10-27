@@ -157,7 +157,7 @@ async function createWorkspace(event) {
       body: JSON.stringify({ name: form.get("name").trim(), description: form.get("description").trim(), copy_from: form.get("copy_from") }),
     });
     $("#new-workspace-dialog").close();
-    toast(`Created workspace ${ws.name}. Edit its topology.md and workspace.toml next.`);
+    toast(`Created workspace ${ws.name}. Edit its topology (context/topology.md for new workspaces) and workspace.toml next.`);
     await loadWorkspaces(ws.name);
     api(`/api/workspaces/${encodeURIComponent(ws.name)}/activate`, { method: "POST" }).catch(() => {});
     showTab("topology");

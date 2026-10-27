@@ -16,6 +16,7 @@ class IterationContext:
     topology: Topology
     snapshot: dict
     memory: dict = field(default_factory=dict)
+    context_documents: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass

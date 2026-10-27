@@ -6,6 +6,9 @@ description: Graph topology for this workspace. Replace the placeholders with yo
 
 Describe the business graph you want to build. Discovery stays blocked until at least one node type is defined; the validator lists anything missing or ambiguous.
 
+Add other `.md` files alongside this file or in subfolders for background context.
+Their contents are unverified references, not topology definitions or approved facts.
+
 Format reference (copy blocks out of this code fence and edit them):
 
 ```markdown

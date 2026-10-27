@@ -1,6 +1,9 @@
 [workspace]
 description = ""
 
+[topology]
+file = "context/topology.md"
+
 # Add one or more sources. Paths are relative to this workspace folder.
 #
 # [sources.local]
@@ -9,10 +12,14 @@ description = ""
 #
 # [sources.prod]
 # type = "databricks"
-# profile = "DEFAULT"              # databricks CLI profile
+# profile = "customer"             # databricks CLI profile (databricks auth login --profile customer)
 # warehouse_id = "<sql-warehouse-id>"
 # catalog = "<catalog>"
-# schema = "<schema>"
+# schema = "<default-schema>"      # optional when every table below is schema-qualified
+# tables = ["orders", "customers", "crm.accounts", "ref_*"]   # optional scope; omit for the whole schema
+# query_timeout_seconds = 120
+#
+# SQLite sources can also limit scope with tables = [...]
 
 [sampling]
 # Raw values may only be returned (and sent to Foundry) for allowlisted table.column globs,

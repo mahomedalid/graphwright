@@ -17,7 +17,8 @@ from ddg.workspaces import create_workspace, describe_workspace
 def test_template_is_hidden_and_blank_workspace_is_actionable(project):
     assert list_workspaces(project) == ["retail"]
     path = create_workspace(project, "sales", description='Sales "pilot"')
-    assert sorted(p.name for p in path.iterdir()) == ["topology.md", "workspace.toml"]
+    assert sorted(p.name for p in path.iterdir()) == ["context", "workspace.toml"]
+    assert (path / "context" / "topology.md").is_file()
     settings = load_settings(project, "sales")
     assert settings.description == 'Sales "pilot"' and settings.sources == {} and settings.sampling.allowlist == []
     topology = load_topology(settings.topology_file, strict=False)

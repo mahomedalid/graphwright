@@ -7,6 +7,7 @@ read-only guard before execution.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import re
 from abc import ABC, abstractmethod
@@ -61,9 +62,10 @@ class SourceAdapter(ABC):
     dialect: str = "generic"
     quote_char: str = '"'
 
-    def __init__(self, name: str, query_timeout_seconds: int = 30):
+    def __init__(self, name: str, query_timeout_seconds: int = 30, table_patterns: list[str] | None = None):
         self.name = name
         self.query_timeout_seconds = query_timeout_seconds
+        self.table_patterns = [p.lower() for p in table_patterns] if table_patterns else None
         self._tables: dict[str, dict] | None = None
         self._columns: dict[str, list[dict]] = {}
         self.query_count = 0
@@ -122,7 +124,10 @@ class SourceAdapter(ABC):
     # ---- discovery operations -------------------------------------------
     def tables(self) -> dict[str, dict]:
         if self._tables is None:
-            self._tables = {t["name"]: t for t in self._load_tables()}
+            loaded = self._load_tables()
+            if self.table_patterns:
+                loaded = [t for t in loaded if any(fnmatch.fnmatchcase(t["name"].lower(), p) for p in self.table_patterns)]
+            self._tables = {t["name"]: t for t in loaded}
         return self._tables
 
     def columns(self, table: str) -> list[dict]:

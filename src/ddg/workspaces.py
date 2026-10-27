@@ -15,6 +15,7 @@ from .config import (
     validate_workspace_name,
     workspaces_dir,
 )
+from .context import markdown_files
 from .topology import load_topology
 
 # Only configuration is copied; runtime artifacts (runs, candidates, facts, ...) never are.
@@ -35,6 +36,10 @@ def create_workspace(root: Path, name: str, source: str = TEMPLATE_NAME, descrip
         for filename in COPY_FILES:
             if (origin / filename).exists():
                 shutil.copyfile(origin / filename, target / filename)
+        for path in markdown_files(origin):
+            destination = target / path.relative_to(origin)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, destination)
         if description:
             _set_description(target / WORKSPACE_FILENAME, description)
     except BaseException:

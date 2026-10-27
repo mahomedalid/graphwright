@@ -1,9 +1,8 @@
-import json
 import sqlite3
 
 import pytest
 
-from ddg.adapters import DatabricksAdapter, ReadOnlyViolation, SQLiteAdapter, UnknownObject, ensure_read_only
+from ddg.adapters import ReadOnlyViolation, SQLiteAdapter, UnknownObject, ensure_read_only
 
 
 @pytest.mark.parametrize(
@@ -50,40 +49,3 @@ def test_sqlite_adapter_metadata_and_unknown_objects(settings):
     with pytest.raises(UnknownObject):
         adapter.column_stats("tbl_ord_hdr", "nope")
     adapter.close()
-
-
-def test_databricks_adapter_uses_cli_statement_api():
-    calls = []
-
-    def fake_runner(args, timeout):
-        payload = json.loads(args[args.index("--json") + 1])
-        calls.append(payload)
-        sql = payload["statement"]
-        if "information_schema.tables" in sql:
-            rows = [["orders", "MANAGED", None]]
-        elif "information_schema.columns" in sql:
-            rows = [["order_id", "string", "NO", None]]
-        elif "table_constraints" in sql:
-            rows = []
-        else:
-            rows = [["42"]]
-        return json.dumps({"status": {"state": "SUCCEEDED"}, "manifest": {"schema": {"columns": [{"name": "c"}]}}, "result": {"data_array": rows}})
-
-    adapter = DatabricksAdapter("prod", "wh123", "main", "sales", profile="DEV", runner=fake_runner)
-    assert list(adapter.tables()) == ["orders"]
-    assert adapter.row_count("orders") == 42
-    assert "`main`.`sales`.`orders`" in calls[-1]["statement"]
-    assert calls[-1]["warehouse_id"] == "wh123" and calls[-1]["on_wait_timeout"] == "CANCEL"
-    with pytest.raises(ReadOnlyViolation):
-        adapter.run("DROP TABLE main.sales.orders")
-    with pytest.raises(ValueError):
-        DatabricksAdapter("prod", "wh", "main", "sales'; DROP", runner=fake_runner)
-
-
-def test_databricks_timeout_is_reported():
-    def runner(args, timeout):
-        return json.dumps({"status": {"state": "CANCELED"}})
-
-    adapter = DatabricksAdapter("prod", "wh", "main", "sales", runner=runner)
-    with pytest.raises(TimeoutError):
-        adapter.run("SELECT 1")

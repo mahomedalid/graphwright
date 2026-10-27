@@ -35,7 +35,7 @@
       <label>Name <input id="new-ws-name" name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,63}" title="Letters, digits, - or _; must not start with - or _"></label>
       <label>Description <input name="description" maxlength="500"></label>
       <label>Start from <select id="new-ws-from" name="copy_from"></select></label>
-      <p class="muted small">Only workspace.toml and topology.md are copied. Runs, candidates, and facts start empty.</p>
+      <p class="muted small">Workspace configuration, topology.md, and context Markdown files are copied. Runs, candidates, and facts start empty.</p>
       <p id="new-ws-error" class="error" role="alert"></p>
       <div class="row">
         <button type="submit" class="primary">Create</button>

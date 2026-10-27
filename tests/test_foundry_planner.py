@@ -60,3 +60,46 @@ def test_foundry_planner_enforces_budget_before_model_call(settings, store):
         planner.run_iteration(ctx, tools)
     assert stop.value.reason == "cancelled"
     assert control.usage.model_calls == 0
+
+
+def test_given_references_when_foundry_runs_then_prompt_contains_full_text_and_paths(settings, store, monkeypatch):
+    import agent_framework
+    import agent_framework.foundry
+    import azure.identity.aio
+    from types import SimpleNamespace
+
+    settings.model.project_endpoint = "https://example.services.ai.azure.com/api/projects/demo"
+    settings.model.model = "gpt-test"
+    control = RunControl(settings.limits, settings.model, cancel_requested=lambda: False)
+    tools = _tools(settings, store, control)
+    prompts = []
+    instructions = []
+
+    class Credential:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class Agent:
+        def __init__(self, client, instruction_text, **kwargs):
+            instructions.append(instruction_text)
+
+        async def run(self, prompt):
+            prompts.append(prompt)
+            return SimpleNamespace(text="DONE")
+
+    monkeypatch.setattr(azure.identity.aio, "DefaultAzureCredential", Credential)
+    monkeypatch.setattr(agent_framework.foundry, "FoundryChatClient", lambda **kwargs: object())
+    monkeypatch.setattr(agent_framework, "Agent", Agent)
+    documents = [{"path": "context/prior/notes.md", "content": "Previous findings\n" + "x" * 13_000}]
+    ctx = IterationContext(
+        1, "retail", load_topology(settings.topology_file), store.review_snapshot(), context_documents=documents
+    )
+
+    result = FoundryPlanner(settings, control).run_iteration(ctx, tools)
+
+    assert result.done
+    assert json.dumps(documents, ensure_ascii=False) in prompts[0]
+    assert "untrusted background data" in instructions[0]

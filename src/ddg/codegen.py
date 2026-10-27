@@ -38,9 +38,10 @@ The Data Discovery Graph product never executes this file. Run it yourself:
     python __FILENAME__ --sqlite path/to/source.sqlite --out graph_output/graph.json
     python __FILENAME__ --databricks --out graph_output/graph.json
 
-Databricks mode needs `pip install databricks-sql-connector` and the environment
-variables DATABRICKS_SERVER_HOSTNAME, DATABRICKS_HTTP_PATH, DATABRICKS_TOKEN.
-Use read-only credentials. Output format: __FORMAT__ (JSON), optional GraphML.
+Databricks mode needs `pip install databricks-sql-connector` and DATABRICKS_HOST
+(or DATABRICKS_SERVER_HOSTNAME). DATABRICKS_HTTP_PATH defaults to the discovery
+warehouse. With DATABRICKS_TOKEN set it uses that token; otherwise it opens a
+browser OAuth sign-in. Use read-only credentials. Output format: __FORMAT__ (JSON), optional GraphML.
 """
 
 import argparse
@@ -65,7 +66,8 @@ def _quote(dialect, identifier):
 
 def _table_ref(dialect, table):
     if dialect == "databricks":
-        return ".".join(_quote(dialect, part) for part in (SPEC["catalog"], SPEC["schema"], table))
+        schema, name = table.split(".", 1) if "." in table else (SPEC["schema"], table)
+        return ".".join(_quote(dialect, part) for part in (SPEC["catalog"], schema, name))
     return _quote(dialect, table)
 
 
@@ -198,11 +200,19 @@ def connect(args):
     if args.databricks:
         from databricks import sql  # type: ignore
 
-        return sql.connect(
-            server_hostname=os.environ["DATABRICKS_SERVER_HOSTNAME"],
-            http_path=os.environ["DATABRICKS_HTTP_PATH"],
-            access_token=os.environ["DATABRICKS_TOKEN"],
-        ), "databricks"
+        host = os.environ.get("DATABRICKS_SERVER_HOSTNAME") or os.environ.get("DATABRICKS_HOST", "")
+        host = host.replace("https://", "").rstrip("/")
+        if not host:
+            sys.exit("Set DATABRICKS_HOST (for example https://adb-123.azuredatabricks.net)")
+        options = {
+            "server_hostname": host,
+            "http_path": os.environ.get("DATABRICKS_HTTP_PATH") or "/sql/1.0/warehouses/%s" % SPEC["warehouse_id"],
+        }
+        if os.environ.get("DATABRICKS_TOKEN"):
+            options["access_token"] = os.environ["DATABRICKS_TOKEN"]
+        else:
+            options["auth_type"] = "databricks-oauth"
+        return sql.connect(**options), "databricks"
     if not args.sqlite:
         sys.exit("Provide --sqlite PATH or --databricks")
     path = os.path.abspath(args.sqlite)
@@ -246,6 +256,7 @@ def render(spec: BuildSpec, source_cfg_options: dict, filename: str, generated_a
         "source": spec.source,
         "catalog": source_cfg_options.get("catalog"),
         "schema": source_cfg_options.get("schema"),
+        "warehouse_id": source_cfg_options.get("warehouse_id"),
         "inputs": {
             "workspace": workspace,
             "source": spec.source,

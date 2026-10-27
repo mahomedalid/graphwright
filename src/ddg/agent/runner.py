@@ -8,6 +8,7 @@ from typing import Any
 
 from ..adapters import create_adapter
 from ..config import Settings
+from ..context import load_context_documents
 from ..control import RunControl, StopRun
 from ..store import Store, atomic_write_json, new_id, utcnow
 from ..tools import DiscoveryTools
@@ -83,6 +84,8 @@ class DiscoveryRunner:
         checkpoint: dict = {"memory": {}, "evidence_index": {}, "iteration": 0}
         try:
             topology = load_topology(self.settings.topology_file, strict=True)
+            context_documents = load_context_documents(self.settings.workspace_dir, self.settings.topology_file)
+            run["context_files"] = [document["path"] for document in context_documents]
             run["topology_version"] = topology.version
             self.store.reconcile()
             source_cfg = self.settings.source(run["source"])
@@ -115,7 +118,7 @@ class DiscoveryRunner:
                 evidence_before = len(tools.evidence_index)
                 started = time.monotonic()
                 self.store.append_event(run_id, {"type": "iteration_started", "iteration": iteration, "review_snapshot_version": snapshot["version"]})
-                ctx = IterationContext(iteration, run["source"], topology, snapshot, memory)
+                ctx = IterationContext(iteration, run["source"], topology, snapshot, memory, context_documents)
                 try:
                     result = planner.run_iteration(ctx, tools)
                 finally:
