@@ -257,7 +257,10 @@ def cmd_generate(args) -> int:
     from .codegen import CodegenError, generate
 
     try:
-        result = generate(_settings(args), args.source, allow_stale=args.allow_stale)
+        result = generate(
+            _settings(args), args.source, allow_stale=args.allow_stale,
+            exclude_fact_ids=args.exclude_fact,
+        )
     except CodegenError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -358,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
     p = add("generate", cmd_generate, "Generate graph-building code from approved facts")
     p.add_argument("--source", required=True)
     p.add_argument("--allow-stale", action="store_true", help="Include facts flagged for revalidation")
+    p.add_argument("--exclude-fact", action="append", default=[], metavar="FACT_ID",
+                   help="Leave an approved fact out of this build only (repeat for multiple facts)")
 
     p = add("serve", cmd_serve, "Start the web UI and API")
     p.add_argument("--host", default="127.0.0.1")

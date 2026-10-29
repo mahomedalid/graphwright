@@ -59,7 +59,11 @@ async function api(path, options = {}) {
   return body;
 }
 
-const state = { status: null, ws: null, wsStatus: null, workspaces: [], selectedRun: null, selectedCandidate: null, cy: null, graph: null };
+const state = {
+  status: null, ws: null, wsStatus: null, workspaces: [], selectedRun: null, selectedCandidate: null, cy: null, graph: null,
+  graphEpoch: 0, graphSearchRequest: 0, graphViewRequest: 0, graphCenter: null, graphNodes: new Map(), graphEdges: new Map(),
+  facts: [], factsLoading: false, factsRequest: 0, factsSourceKey: null, factExclusions: new Set(), factReview: null,
+};
 
 function wsApi(path, options) {
   if (!state.ws) return Promise.reject(new Error("No workspace selected"));
@@ -99,8 +103,12 @@ async function switchWorkspace(name, { persist = true } = {}) {
   localStorage.setItem("ddg-workspace", name);
   state.selectedRun = null;
   state.selectedCandidate = null;
-  state.graph = null;
-  state.cy?.elements().remove();
+  state.factsRequest++;
+  state.factsSourceKey = null;
+  state.factExclusions.clear();
+  state.factReview = null;
+  if ($("#fact-revalidation-dialog").open) $("#fact-revalidation-dialog").close();
+  resetGraphExplorer();
   $("#run-detail").classList.add("hidden");
   clear($("#candidate-detail")).append(h("p", { className: "muted" }, "Select a candidate to review its evidence."));
   clear($("#graph-detail")).append(h("p", { className: "muted" }, "Search, then select a node to load its neighborhood."));
@@ -496,45 +504,166 @@ async function selectCandidate(id) {
 // ---------- facts & codegen ----------
 async function loadFacts() {
   const source = $("#facts-source").value;
+  const workspace = state.ws;
+  const request = ++state.factsRequest;
+  const sourceKey = `${workspace}:${source}`;
+  if (state.factsSourceKey !== sourceKey) {
+    state.factsSourceKey = sourceKey;
+    state.factExclusions.clear();
+    state.factReview = null;
+    $("#fact-revalidation-dialog").close();
+    clear($("#codegen-result"));
+  }
+  const current = () => state.ws === workspace && request === state.factsRequest && $("#facts-source").value === source;
+  state.facts = [];
+  state.factsLoading = true;
+  $("#generate-btn").disabled = true;
+  $("#facts-selection-status").textContent = "Checking the selected source...";
+  clear($("#facts-table tbody"));
+  clear($("#revalidation"));
   if (!source) {
+    state.factsLoading = false;
+    $("#facts-selection-status").textContent = "";
     clear($("#facts-table tbody")).append(h("tr", {}, h("td", { colspan: 5, className: "muted" }, "This workspace has no sources yet.")));
     clear($("#revalidation"));
     clear($("#generated-list"));
     return;
   }
-  const [facts, generated] = await Promise.all([wsApi(`/facts?source=${encodeURIComponent(source)}`), wsApi("/codegen")]);
+  let generated, report;
+  try {
+    [generated, report] = await Promise.all([
+      wsApi("/codegen"),
+      wsApi(`/facts/revalidation?source=${encodeURIComponent(source)}`),
+    ]);
+  } catch (e) {
+    if (!current()) return;
+    state.factsLoading = false;
+    $("#facts-selection-status").textContent = "Mappings could not be checked. Restore source access and select Recheck mappings.";
+    clear($("#revalidation")).append(h("p", { className: "error" }, `Could not check approved mappings: ${e.message}`));
+    toast(e.message, true);
+    return;
+  }
+  if (!current()) return;
+  const facts = report.facts;
+  state.facts = facts;
+  state.factsLoading = false;
+  $("#generate-btn").disabled = false;
+  state.factExclusions = new Set([...state.factExclusions].filter((id) => facts.some((f) => f.id === id)));
   const tbody = clear($("#facts-table tbody"));
   for (const f of facts) {
     const m = f.mapping || {};
+    const check = report.validations[f.id];
+    const supported = ["node_mapping", "edge_mapping"].includes(f.kind);
     const summary = f.kind === "node_mapping" ? `${m.node_type} ← ${m.source_table}(${(m.key_columns || []).join(", ")})`
       : f.kind === "edge_mapping" ? `${m.from_node_type} -[${m.edge_type}]-> ${m.to_node_type} ← ${m.source_table}` : f.hypothesis;
-    tbody.append(h("tr", {}, h("td", { className: "small" }, f.id), h("td", {}, f.kind), h("td", {}, summary),
-      h("td", {}, `${f.approved_by} · ${fmtTime(f.approved_at)}`), h("td", {}, f.notes || "")));
+    const include = supported ? h("input", {
+      type: "checkbox", checked: !state.factExclusions.has(f.id), "aria-label": `Include ${f.id} in this build`,
+      onchange: (event) => {
+        if (event.target.checked) state.factExclusions.delete(f.id);
+        else state.factExclusions.add(f.id);
+        updateFactSelection(true);
+      },
+    }) : null;
+    const review = check.needs_revalidation && supported ? h("button", {
+      disabled: !check.can_revalidate, onclick: () => openFactRevalidation(f, check, report.topology_version),
+    }, "Review old approval") : null;
+    const lastReview = f.revalidations?.at(-1);
+    tbody.append(h("tr", {},
+      h("td", {}, include), h("td", { className: "small" }, f.id, h("div", { className: "muted" }, f.kind)),
+      h("td", {}, summary,
+        check.errors.length ? h("div", { className: "error" }, h("strong", {}, "Mapping needs correction"),
+          h("ul", { className: "fact-problems" }, check.errors.map((error) => h("li", {}, error)))) : null,
+        check.needs_revalidation ? h("p", { className: "warn small" }, "Approved for an older graph definition or source schema; review before reuse.") : null,
+        f.notes ? h("p", { className: "small muted" }, f.notes) : null),
+      h("td", { className: "small" }, `${f.approved_by} · ${fmtTime(f.approved_at)}`,
+        lastReview ? h("p", {}, `Revalidated by ${lastReview.reviewer} · ${fmtTime(lastReview.at)}`) : null),
+      h("td", {}, review, check.errors.length ? h("p", { className: "small" },
+        "A new approval cannot fix this mapping. Leave it out of this build or review a corrected mapping.") : null)));
   }
   if (!facts.length) tbody.append(h("tr", {}, h("td", { colspan: 5, className: "muted" }, "No approved facts yet.")));
   const reval = clear($("#revalidation"));
-  try {
-    const r = await wsApi(`/facts/revalidation?source=${encodeURIComponent(source)}`);
-    const issues = Object.values(r.issues).flat();
-    if (!r.source_reachable) reval.append(h("p", { className: "warn" }, "Source unreachable; schema drift not checked."));
-    if (issues.length) reval.append(h("div", { className: "warn" }, h("strong", {}, "Needs revalidation:"), h("ul", {}, issues.map((i) => h("li", {}, i)))));
-  } catch (e) { reval.append(h("p", { className: "error" }, e.message)); }
+  const issues = Object.values(report.issues).flat();
+  if (!report.source_reachable) reval.append(h("p", { className: "error" }, "Source unreachable. Schema checks and revalidation are unavailable until source access is restored."));
+  if (issues.length) reval.append(
+    h("p", { className: "warn" }, "Some approvals need review. Use Review old approval on the relevant row. This confirms your review; it does not invent or repair mappings."),
+    h("details", {}, h("summary", {}, "Technical version details"), h("ul", {}, issues.map((i) => h("li", {}, i)))));
+  updateFactSelection();
   const list = clear($("#generated-list"));
-  for (const g of generated) list.append(h("li", {}, h("code", {}, g.builder), h("div", { className: "small muted" }, `${fmtTime(g.generated_at)} · ${g.source} · ${g.facts.length} facts`), h("code", { className: "small" }, g.suggested_command)));
+  for (const g of generated) list.append(h("li", {}, h("code", {}, g.builder), h("div", { className: "small muted" },
+    `${fmtTime(g.generated_at)} · ${g.source} · ${g.facts.length} facts · ${g.excluded_fact_ids?.length || 0} left out`),
+    h("code", { className: "small" }, g.suggested_command)));
+}
+
+function updateFactSelection(changed = false) {
+  const mappings = state.facts.filter((f) => ["node_mapping", "edge_mapping"].includes(f.kind));
+  const excluded = mappings.filter((f) => state.factExclusions.has(f.id)).length;
+  $("#facts-selection-status").textContent = `${mappings.length - excluded} mappings selected; ${excluded} left out of this build. Approved facts are unchanged.`;
+  if (changed) clear($("#codegen-result")).append(h("p", { className: "muted" }, "Build selection changed. Generate again to check the selected mappings."));
+}
+
+function openFactRevalidation(fact, check, topologyVersion) {
+  if (state.factsLoading || !state.facts.some((f) => f.id === fact.id) || !check.can_revalidate) return;
+  state.factReview = { fact, check, topologyVersion, workspace: state.ws, source: $("#facts-source").value };
+  $("#fact-revalidation-form").reset();
+  $("#fact-revalidation-reviewer").value = $("#reviewer").value || localStorage.getItem("ddg-reviewer") || "";
+  $("#fact-revalidation-error").textContent = "";
+  const preview = clear($("#fact-revalidation-preview"));
+  appendAll(preview, h("h3", {}, fact.hypothesis), h("p", { className: "small muted" }, fact.id),
+    mappingTable(fact.mapping),
+    h("h3", {}, "Recorded limitations"), h("ul", {}, (fact.limitations || []).map((text) => h("li", {}, text))),
+    h("details", {}, h("summary", {}, "Previous revalidations"), json(fact.revalidations || [])));
+  $("#fact-revalidation-dialog").showModal();
+}
+
+async function submitFactRevalidation(event) {
+  event.preventDefault();
+  const review = state.factReview;
+  if (!review || review.workspace !== state.ws || review.source !== $("#facts-source").value) return;
+  const button = $("#fact-revalidation-form button[type=submit]");
+  button.disabled = true;
+  try {
+    await wsApi(`/facts/${encodeURIComponent(review.fact.id)}/revalidate`, {
+      method: "POST", body: JSON.stringify({
+        reviewer: $("#fact-revalidation-reviewer").value.trim(),
+        notes: $("#fact-revalidation-notes").value.trim(),
+        confirm_meaning: $("#fact-revalidation-confirm").checked,
+        expected_token: review.check.token, expected_topology_version: review.topologyVersion,
+      }),
+    });
+    if (review !== state.factReview || review.workspace !== state.ws) return;
+    localStorage.setItem("ddg-reviewer", $("#fact-revalidation-reviewer").value.trim());
+    state.factReview = null;
+    $("#fact-revalidation-dialog").close();
+    clear($("#codegen-result")).append(h("p", {}, "Approval updated. Generate again to check the selected mappings."));
+    toast("Approval revalidated. Data evidence was not rerun.");
+    await loadFacts();
+  } catch (e) {
+    if (review !== state.factReview || review.workspace !== state.ws) return;
+    $("#fact-revalidation-error").textContent = (e.body?.errors || [e.message]).join("\n");
+  } finally { button.disabled = false; }
 }
 
 async function generateCode() {
+  if (state.factsLoading) { toast("Wait for the selected source's mappings to finish loading.", true); return; }
   const out = clear($("#codegen-result"));
+  const workspace = state.ws;
+  const source = $("#facts-source").value;
   try {
-    const result = await wsApi("/codegen", { method: "POST", body: JSON.stringify({ source: $("#facts-source").value, allow_stale: $("#allow-stale").checked }) });
+    const result = await wsApi("/codegen", { method: "POST", body: JSON.stringify({
+      source, allow_stale: $("#allow-stale").checked, exclude_fact_ids: [...state.factExclusions],
+    }) });
+    if (workspace !== state.ws || source !== $("#facts-source").value) return;
     appendAll(out, h("p", {}, "Generated ", h("code", {}, result.path)),
       result.warnings.length ? h("ul", { className: "warn" }, result.warnings.map((w) => h("li", {}, w))) : null,
       h("p", {}, "Review it, then run:"), h("pre", {}, result.suggested_command),
       h("details", {}, h("summary", {}, "View code"), h("pre", {}, result.code)));
     loadFacts();
   } catch (e) {
+    if (workspace !== state.ws || source !== $("#facts-source").value) return;
     const errors = e.body?.errors || [e.message];
-    appendAll(out, h("p", { className: "error" }, "Code generation is blocked:"), h("ul", { className: "error" }, errors.map((x) => h("li", {}, x))),
+    appendAll(out, h("p", { className: "error" }, "Selected mappings cannot be built yet:"),
+      h("p", {}, "Find each fact below in Approved facts. Review old approvals, or uncheck unresolved mappings to generate a smaller graph. Nothing is excluded automatically."),
+      h("ul", { className: "error" }, errors.map((x) => h("li", {}, x))),
       e.body?.warnings?.length ? h("ul", { className: "warn" }, e.body.warnings.map((w) => h("li", {}, w))) : null);
   }
 }
@@ -549,48 +678,142 @@ function colorFor(type) {
 function nodeLabel(n) {
   const p = n.properties || {};
   const named = p.name ?? p.title ?? p.label;
-  return `${n.type}: ${named ?? n.key}`;
+  return `${n.type}: ${named ?? n.key ?? n.id}`;
+}
+
+function clearGraphView() {
+  state.graphViewRequest++;
+  state.graphCenter = null;
+  state.graphNodes.clear();
+  state.graphEdges.clear();
+  state.cy?.elements().remove();
+  document.querySelectorAll("#graph-results .item").forEach((b) => b.removeAttribute("aria-current"));
+  clear($("#graph-text"));
+  clear($("#graph-detail")).append(h("p", { className: "muted" }, "Select a starting node to explore its neighborhood."));
+  $("#graph-view-status").textContent = "Select a starting node to explore its neighborhood.";
+}
+
+function resetGraphExplorer() {
+  state.graph = null;
+  state.graphEpoch++;
+  state.graphSearchRequest++;
+  clearGraphView();
+  clear($("#graph-results"));
+  clear($("#graph-stats"));
+  $("#graph-summary").textContent = "";
+  $("#graph-search-status").textContent = "";
 }
 
 async function loadGraphFiles() {
-  const files = await wsApi("/graphs");
-  const select = $("#graph-file");
-  const current = select.value;
-  clear(select);
-  if (!files.length) {
-    select.append(h("option", { value: "" }, "No graph output yet"));
-    $("#graph-summary").textContent = "Generate builder code from approved facts, run it, and write its JSON output to graph_output/.";
-    return;
+  const workspace = state.ws;
+  try {
+    const files = await wsApi("/graphs");
+    if (state.ws !== workspace) return;
+    const select = $("#graph-file");
+    const current = select.value;
+    clear(select);
+    if (!files.length) {
+      resetGraphExplorer();
+      select.append(h("option", { value: "" }, "No graph output yet"));
+      $("#graph-summary").textContent = "Generate builder code from approved facts, run it, and write its JSON output to graph_output/.";
+      return;
+    }
+    files.forEach((f) => select.append(h("option", { value: f.name }, f.name)));
+    if (current && files.some((f) => f.name === current)) select.value = current;
+    await loadGraphSummary();
+  } catch (e) {
+    if (state.ws !== workspace) return;
+    resetGraphExplorer();
+    $("#graph-search-status").textContent = `Unable to load graph files: ${e.message}`;
+    toast(e.message, true);
   }
-  files.forEach((f) => select.append(h("option", { value: f.name }, f.name)));
-  if (current && files.some((f) => f.name === current)) select.value = current;
-  await loadGraphSummary();
 }
 
 async function loadGraphSummary() {
   const name = $("#graph-file").value;
+  resetGraphExplorer();
+  const epoch = state.graphEpoch;
   if (!name) return;
   try {
     const s = await wsApi(`/graphs/${encodeURIComponent(name)}/summary`);
+    if (epoch !== state.graphEpoch) return;
     state.graph = name;
-    const typeSelect = clear($("#graph-type"));
-    typeSelect.append(h("option", { value: "" }, "All types"));
-    Object.keys(s.node_types).forEach((t) => typeSelect.append(h("option", { value: t }, `${t} (${s.node_types[t]})`)));
+    for (const [id, label, types] of [
+      ["#graph-type", "All node types", s.node_types],
+      ["#graph-neighbor-type", "Any neighbor type", s.node_types],
+      ["#graph-edge-type", "All relationships", s.edge_types],
+    ]) {
+      const select = $(id);
+      const previous = select.value;
+      clear(select).append(h("option", { value: "" }, label));
+      Object.entries(types).forEach(([t, count]) => select.append(h("option", { value: t }, `${t} (${count})`)));
+      if (Object.hasOwn(types, previous)) select.value = previous;
+    }
     const inputs = s.inputs || {};
     $("#graph-summary").textContent = `${s.node_count} nodes · ${s.edge_count} edges · edges: ${Object.entries(s.edge_types).map(([k, v]) => `${k} ${v}`).join(", ")} · built ${fmtTime(s.built_at)} · topology ${inputs.topology_version} · ${inputs.facts?.length ?? 0} facts${(s.warnings || []).length ? " · warnings: " + s.warnings.join("; ") : ""}`;
+    const stats = s.connectivity;
+    for (const [label, count] of [
+      ["Connected nodes", stats.connected_nodes], ["Nodes with 2+ edges", stats.multi_edge_nodes],
+      ["Isolated nodes", stats.isolated_nodes], ["Maximum edges per node", stats.max_degree],
+    ]) $("#graph-stats").append(h("div", { className: "graph-stat" }, h("strong", {}, count.toLocaleString()), label));
+    if (!s.edge_count) $("#graph-stats").append(h("p", { className: "warn" },
+      "This graph has no edges. Connectivity filters cannot find connected nodes until relationships with matching endpoints are generated. Choose All nodes to browse isolated records."));
     await graphSearch();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    if (epoch !== state.graphEpoch) return;
+    $("#graph-search-status").textContent = `Unable to load graph: ${e.message}`;
+    toast(e.message, true);
+  }
+}
+
+function graphEdgeParams() {
+  return new URLSearchParams({
+    edge_type: $("#graph-edge-type").value, direction: $("#graph-direction").value,
+    neighbor_type: $("#graph-neighbor-type").value,
+  });
+}
+
+function graphPreset(preset) {
+  $("#graph-search-form").reset();
+  if (preset === "branching") $("#graph-min-degree").value = "2";
+  if (preset === "hubs") { $("#graph-min-neighbors").value = "5"; $("#graph-sort").value = "neighbors"; }
+  if (preset === "varied") { $("#graph-min-edge-types").value = "2"; $("#graph-sort").value = "edge_types"; }
+  return graphSearch();
 }
 
 async function graphSearch() {
-  if (!state.graph) return;
-  const q = encodeURIComponent($("#graph-q").value);
-  const type = encodeURIComponent($("#graph-type").value);
-  const results = await wsApi(`/graphs/${encodeURIComponent(state.graph)}/search?q=${q}&type=${type}&limit=100`);
+  if (!state.graph || !$("#graph-search-form").reportValidity()) return;
+  const request = ++state.graphSearchRequest;
+  const epoch = state.graphEpoch;
+  clearGraphView();
+  const params = graphEdgeParams();
+  for (const [key, id] of [
+    ["q", "#graph-q"], ["type", "#graph-type"], ["min_degree", "#graph-min-degree"],
+    ["min_neighbors", "#graph-min-neighbors"], ["min_edge_types", "#graph-min-edge-types"], ["sort", "#graph-sort"],
+  ]) params.set(key, $(id).value);
+  params.set("limit", "101");
   const list = clear($("#graph-results"));
-  if (!results.length) list.append(h("p", { className: "muted" }, "No matches."));
-  for (const n of results) list.append(h("button", { className: "item", onclick: () => expandNode(n.id, true) },
-    h("span", { className: "title" }, nodeLabel(n)), h("span", { className: "small muted" }, n.id)));
+  $("#graph-search-status").textContent = "Finding nodes...";
+  try {
+    const results = await wsApi(`/graphs/${encodeURIComponent(state.graph)}/search?${params}`);
+    if (epoch !== state.graphEpoch || request !== state.graphSearchRequest) return;
+    $("#graph-search-status").textContent = results.length > 100
+      ? "Showing the first 100 matches in the selected order. Refine filters to narrow the results."
+      : `${results.length} matching node${results.length === 1 ? "" : "s"}.`;
+    if (!results.length) list.append(h("p", { className: "muted" }, "No nodes match these filters. Lower the minimum counts or choose All nodes."));
+    for (const n of results.slice(0, 100)) {
+      const m = n.connectivity;
+      list.append(h("button", { className: "item", "data-node-id": n.id, onclick: () => expandNode(n.id, true) },
+        h("span", { className: "title" }, nodeLabel(n)), h("span", { className: "small muted" }, n.id),
+        h("span", { className: "graph-metrics" },
+          pill(`${m.degree} edges`), pill(`${m.neighbor_count} neighbors`), pill(`${m.edge_type_count} types`)),
+        h("span", { className: "small muted" }, m.edge_types.join(", "))));
+    }
+  } catch (e) {
+    if (epoch !== state.graphEpoch || request !== state.graphSearchRequest) return;
+    $("#graph-search-status").textContent = `Search failed: ${e.message}`;
+    toast(e.message, true);
+  }
 }
 
 function ensureCy() {
@@ -612,22 +835,42 @@ function ensureCy() {
 }
 
 async function expandNode(nodeId, reset = false) {
-  const depth = $("#graph-depth").value;
-  const data = await wsApi(`/graphs/${encodeURIComponent(state.graph)}/neighborhood?node_id=${encodeURIComponent(nodeId)}&depth=${depth}&limit=200`);
-  const cy = ensureCy();
-  if (cy) {
-    if (reset) cy.elements().remove();
-    cy.nodes().removeClass("center");
-    const add = [];
-    for (const n of data.nodes) if (cy.getElementById(n.id).empty()) add.push({ group: "nodes", data: { id: n.id, label: nodeLabel(n), color: colorFor(n.type), raw: n } });
-    for (const e of data.edges) if (cy.getElementById(e.id).empty()) add.push({ group: "edges", data: { id: e.id, source: e.source, target: e.target, type: e.type, raw: e } });
-    cy.add(add);
-    cy.getElementById(nodeId).addClass("center");
-    cy.layout({ name: "cose", animate: false, nodeRepulsion: 9000, idealEdgeLength: 90 }).run();
+  if (!state.graph) return;
+  if (reset) clearGraphView();
+  const request = ++state.graphViewRequest;
+  const epoch = state.graphEpoch;
+  const params = graphEdgeParams();
+  params.set("node_id", nodeId);
+  params.set("depth", $("#graph-depth").value);
+  params.set("limit", "200");
+  $("#graph-view-status").textContent = "Loading neighborhood...";
+  try {
+    const data = await wsApi(`/graphs/${encodeURIComponent(state.graph)}/neighborhood?${params}`);
+    if (epoch !== state.graphEpoch || request !== state.graphViewRequest) return;
+    state.graphCenter = nodeId;
+    data.nodes.forEach((n) => state.graphNodes.set(n.id, n));
+    data.edges.forEach((e) => state.graphEdges.set(e.id, e));
+    const cy = ensureCy();
+    if (cy) {
+      cy.resize();
+      cy.nodes().removeClass("center");
+      const add = [];
+      for (const n of data.nodes) if (cy.getElementById(n.id).empty()) add.push({ group: "nodes", data: { id: n.id, label: nodeLabel(n), color: colorFor(n.type), raw: n } });
+      for (const e of data.edges) if (cy.getElementById(e.id).empty()) add.push({ group: "edges", data: { id: e.id, source: e.source, target: e.target, type: e.type, raw: e } });
+      cy.add(add);
+      cy.getElementById(nodeId).addClass("center");
+      cy.layout({ name: "cose", animate: false, nodeRepulsion: 9000, idealEdgeLength: 90 }).run();
+    }
+    document.querySelectorAll("#graph-results .item").forEach((b) => b.setAttribute("aria-current", String(b.dataset.nodeId === nodeId)));
+    $("#graph-view-status").textContent = `${state.graphNodes.size} nodes and ${state.graphEdges.size} edges displayed${data.truncated ? " · Latest neighborhood limited to 200 nodes; narrow filters to see a smaller neighborhood." : ""}`;
+    const center = data.nodes.find((n) => n.id === nodeId);
+    showNodeDetail(center, data);
+    renderTextView();
+  } catch (e) {
+    if (epoch !== state.graphEpoch || request !== state.graphViewRequest) return;
+    $("#graph-view-status").textContent = `Unable to load neighborhood: ${e.message}`;
+    toast(e.message, true);
   }
-  const center = data.nodes.find((n) => n.id === nodeId);
-  showNodeDetail(center, data);
-  renderTextView();
 }
 
 function provenanceList(prov) {
@@ -639,7 +882,12 @@ function showNodeDetail(node, neighborhood) {
   const panel = clear($("#graph-detail"));
   appendAll(panel, h("h2", {}, nodeLabel(node)),
     h("p", { className: "small muted" }, node.id),
-    neighborhood ? h("p", { className: "small" }, `Degree ${neighborhood.degree}${neighborhood.truncated ? " · neighborhood truncated" : ""}`) : null,
+    node.connectivity ? h("p", { className: "small" },
+      `${node.connectivity.degree} matching edges · ${node.connectivity.neighbor_count} distinct neighbors · ${node.connectivity.edge_type_count} relationship types`,
+      h("br"), `${node.connectivity.in_degree} incoming · ${node.connectivity.out_degree} outgoing`,
+      h("br"), node.connectivity.edge_types.join(", ")) : null,
+    neighborhood ? h("p", { className: "small muted" },
+      `${neighborhood.total_degree} total incident edges${neighborhood.truncated ? " · neighborhood truncated" : ""}`) : null,
     h("h3", {}, "Properties"), mappingTable(node.properties),
     h("h3", {}, "Provenance"), provenanceList(node.provenance),
     h("button", { onclick: () => expandNode(node.id) }, "Expand neighborhood"));
@@ -653,10 +901,9 @@ function showEdgeDetail(edge) {
 
 function renderTextView() {
   const out = clear($("#graph-text"));
-  const cy = state.cy;
-  if (!cy) return;
-  const nodes = cy.nodes().map((n) => n.data("raw"));
-  const edges = cy.edges().map((e) => e.data("raw"));
+  const nodes = [...state.graphNodes.values()];
+  const edges = [...state.graphEdges.values()];
+  if (!nodes.length) return;
   appendAll(out, 
     h("h3", {}, `Nodes (${nodes.length})`),
     h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Type"), h("th", {}, "Key"), h("th", {}, "Properties"), h("th", {}, "Sources"))),
@@ -988,12 +1235,21 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#review-refresh").addEventListener("click", loadCandidates);
   $("#reviewer").value = localStorage.getItem("ddg-reviewer") || "";
   $("#facts-source").addEventListener("change", loadFacts);
+  $("#facts-recheck-btn").addEventListener("click", loadFacts);
+  $("#fact-revalidation-form").addEventListener("submit", submitFactRevalidation);
+  $("#fact-revalidation-cancel").addEventListener("click", () => { state.factReview = null; $("#fact-revalidation-dialog").close(); });
+  $("#fact-revalidation-dialog").addEventListener("cancel", () => { state.factReview = null; });
   $("#generate-btn").addEventListener("click", generateCode);
   $("#graph-file").addEventListener("change", loadGraphSummary);
-  $("#graph-search-btn").addEventListener("click", graphSearch);
-  $("#graph-q").addEventListener("keydown", (e) => { if (e.key === "Enter") graphSearch(); });
-  $("#graph-type").addEventListener("change", graphSearch);
-  $("#graph-clear-btn").addEventListener("click", () => { state.cy?.elements().remove(); renderTextView(); });
+  $("#graph-search-form").addEventListener("submit", (e) => { e.preventDefault(); graphSearch(); });
+  for (const id of ["#graph-type", "#graph-edge-type", "#graph-direction", "#graph-neighbor-type",
+    "#graph-min-degree", "#graph-min-neighbors", "#graph-min-edge-types", "#graph-sort"]) {
+    $(id).addEventListener("change", graphSearch);
+  }
+  document.querySelectorAll("[data-graph-preset]").forEach((b) => b.addEventListener("click", () => graphPreset(b.dataset.graphPreset)));
+  $("#graph-depth").addEventListener("change", () => { if (state.graphCenter) expandNode(state.graphCenter, true); });
+  $("#graph-clear-btn").addEventListener("click", clearGraphView);
+  $("#graph-fit-btn").addEventListener("click", () => { state.cy?.resize(); state.cy?.fit(undefined, 30); });
   $("#meta-source").addEventListener("change", loadMetadata);
   $("#review-tier").addEventListener("change", loadCandidates);
   $("#reset-btn").addEventListener("click", openResetDialog);

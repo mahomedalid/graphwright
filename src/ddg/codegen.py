@@ -291,8 +291,17 @@ def render(spec: BuildSpec, source_cfg_options: dict, filename: str, generated_a
     )
 
 
-def generate(settings: Settings, source: str, allow_stale: bool = False, store: Store | None = None) -> dict:
+def generate(
+    settings: Settings, source: str, allow_stale: bool = False, store: Store | None = None, *,
+    exclude_fact_ids: list[str] | None = None,
+) -> dict:
     store = store or Store(settings)
+    facts = store.list_facts(source)
+    excluded = set(exclude_fact_ids or [])
+    unknown = excluded - {fact["id"] for fact in facts}
+    if unknown:
+        raise CodegenError([f"Cannot exclude unknown facts for source '{source}': {', '.join(sorted(unknown))}"])
+    facts = [fact for fact in facts if fact["id"] not in excluded]
     try:
         topology = load_workspace_topology(settings)
     except TopologyError as exc:
@@ -304,12 +313,16 @@ def generate(settings: Settings, source: str, allow_stale: bool = False, store: 
     except Exception:  # noqa: BLE001 - source unreachable: generate without live schema checks
         adapter = None
     try:
-        spec = build_spec(store.list_facts(source), topology, source, adapter, allow_stale=allow_stale)
+        spec = build_spec(facts, topology, source, adapter, allow_stale=allow_stale)
     finally:
         if adapter is not None:
             adapter.close()
     if adapter is None:
         spec.warnings.append("Source was unreachable; column existence and schema drift were not verified")
+    if excluded:
+        spec.warnings.append(
+            "Explicitly left out of this build (approved facts unchanged): " + ", ".join(sorted(excluded))
+        )
     if not spec.ok:
         raise CodegenError(spec.errors, spec.warnings)
     generated_at = datetime.now(UTC).isoformat(timespec="seconds")
@@ -326,6 +339,7 @@ def generate(settings: Settings, source: str, allow_stale: bool = False, store: 
         "source": source,
         "topology_version": spec.topology_version,
         "facts": spec.fact_versions,
+        "excluded_fact_ids": sorted(excluded),
         "warnings": spec.warnings,
         "suggested_command": _suggested_command(settings, source_cfg, path),
     }

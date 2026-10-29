@@ -131,6 +131,59 @@ def test_given_maximum_iteration_limit_when_starting_then_99_is_accepted(client)
     _wait(client, response.json()["id"])
 
 
+@pytest.fixture
+def explorer_graph(settings):
+    settings.graph_output_dir.mkdir(parents=True, exist_ok=True)
+    graph = {
+        "format": "ddg-graph/v1",
+        "nodes": [
+            {"id": "A", "type": "Account", "properties": {"name": "hub"}},
+            {"id": "B", "type": "Person", "properties": {}},
+            {"id": "C", "type": "Address", "properties": {}},
+            {"id": "Z", "type": "Account", "properties": {}},
+        ],
+        "edges": [
+            {"id": "e1", "type": "holder", "source": "A", "target": "B"},
+            {"id": "e2", "type": "billing", "source": "A", "target": "C"},
+        ],
+    }
+    (settings.graph_output_dir / "explorer.json").write_text(json.dumps(graph), encoding="utf-8")
+    return "/api/w/retail/graphs/explorer.json"
+
+
+def test_given_connectivity_filters_when_searching_graph_then_returns_ranked_nodes(client, explorer_graph):
+    response = client.get(f"{explorer_graph}/search", params={
+        "q": "hub", "type": "Account", "min_degree": 2, "min_neighbors": 2,
+        "min_edge_types": 2, "sort": "degree", "limit": 1,
+    })
+
+    assert response.status_code == 200
+    assert [node["id"] for node in response.json()] == ["A"]
+    assert response.json()[0]["connectivity"]["degree"] == 2
+
+
+def test_given_edge_filters_when_searching_and_expanding_then_results_agree(client, explorer_graph):
+    filters = {"edge_type": "holder", "direction": "out", "neighbor_type": "Person"}
+
+    search = client.get(f"{explorer_graph}/search", params=filters)
+    neighborhood = client.get(f"{explorer_graph}/neighborhood", params={**filters, "node_id": "A"})
+
+    assert search.status_code == neighborhood.status_code == 200
+    assert [node["id"] for node in search.json()] == ["A"]
+    assert search.json()[0]["connectivity"]["degree"] == neighborhood.json()["degree"] == 1
+    assert [edge["id"] for edge in neighborhood.json()["edges"]] == ["e1"]
+
+
+@pytest.mark.parametrize("params", [
+    {"min_degree": -1}, {"min_neighbors": -1}, {"min_edge_types": -1},
+    {"min_degree": "1.5"}, {"sort": "unknown"}, {"direction": "sideways"}, {"limit": 501},
+])
+def test_given_invalid_graph_filters_when_searching_then_rejects_request(client, explorer_graph, params):
+    response = client.get(f"{explorer_graph}/search", params=params)
+
+    assert response.status_code == 422
+
+
 def test_api_token_is_enforced(project, monkeypatch):
     monkeypatch.setenv("DDG_API_TOKEN", "s3cret")
     client = TestClient(create_app(project))

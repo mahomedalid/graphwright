@@ -150,15 +150,18 @@
     <section id="tab-facts" role="tabpanel" class="tab hidden">
       <div class="toolbar">
         <label>Source <select id="facts-source"></select></label>
-        <label class="inline"><input type="checkbox" id="allow-stale"> Include facts flagged for revalidation</label>
+        <label class="inline"><input type="checkbox" id="allow-stale"> Bypass old-approval warnings (does not fix invalid mappings)</label>
         <button id="generate-btn" class="primary">Generate graph builder code</button>
       </div>
       <div class="grid two">
         <div class="card">
           <h2>Approved facts</h2>
+          <p class="small">Choose which mappings to include. Uncheck an unresolved mapping to leave it out of this build without deleting its approval. If you leave out a node mapping, its relationships may also need to be left out.</p>
+          <p id="facts-selection-status" class="small muted" role="status"></p>
+          <button id="facts-recheck-btn">Recheck mappings</button>
           <div id="revalidation"></div>
           <div class="table-wrap"><table id="facts-table">
-            <thead><tr><th>Fact</th><th>Kind</th><th>Mapping</th><th>Approved by</th><th>Notes</th></tr></thead>
+            <thead><tr><th>Include</th><th>Fact</th><th>Mapping and checks</th><th>Approved by</th><th>Review</th></tr></thead>
             <tbody></tbody>
           </table></div>
         </div>
@@ -172,20 +175,68 @@
       </div>
     </section>
 
+    <dialog id="fact-revalidation-dialog" aria-labelledby="fact-revalidation-title">
+      <form id="fact-revalidation-form">
+        <h2 id="fact-revalidation-title">Review an older approval</h2>
+        <p>Confirm that this mapping still has the intended business meaning in the current graph definition. The app will check source columns, schema, and endpoint ID structure again before saving.</p>
+        <p class="warn">This does not rerun data profiling, uniqueness checks, or join evidence, and does not repair mappings. If the mapping is wrong or uncertain, cancel and leave it out of the build instead.</p>
+        <div id="fact-revalidation-preview"></div>
+        <label>Reviewer <input id="fact-revalidation-reviewer" maxlength="200" required></label>
+        <label>What did you review? <textarea id="fact-revalidation-notes" maxlength="5000" required></textarea></label>
+        <label class="inline"><input id="fact-revalidation-confirm" type="checkbox" required> I reviewed the mapping and confirm its meaning is still correct.</label>
+        <p id="fact-revalidation-error" class="error" role="alert"></p>
+        <div class="row">
+          <button type="submit" class="primary">Validate and confirm approval</button>
+          <button type="button" id="fact-revalidation-cancel">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+
     <!-- Graph -->
     <section id="tab-graph" role="tabpanel" class="tab hidden">
       <div class="toolbar">
         <label>Graph file <select id="graph-file"></select></label>
-        <label>Search <input id="graph-q" placeholder="id or property value"></label>
-        <label>Type <select id="graph-type"><option value="">All types</option></select></label>
         <label>Depth <select id="graph-depth"><option>1</option><option>2</option><option>3</option></select></label>
-        <button id="graph-search-btn">Search</button>
+        <button id="graph-fit-btn">Fit view</button>
         <button id="graph-clear-btn">Clear view</button>
       </div>
       <div id="graph-summary" class="muted small"></div>
+      <div id="graph-stats" class="graph-stats" aria-label="Graph connectivity summary"></div>
+      <form id="graph-search-form" class="card">
+        <div class="graph-presets" aria-label="Connectivity shortcuts">
+          <strong>Find interesting nodes</strong>
+          <button type="button" data-graph-preset="all">All nodes</button>
+          <button type="button" data-graph-preset="branching">2+ edges</button>
+          <button type="button" data-graph-preset="hubs">Hubs: 5+ neighbors</button>
+          <button type="button" data-graph-preset="varied">2+ relationship types</button>
+        </div>
+        <div class="graph-filters">
+          <label>Search nodes <input id="graph-q" type="search" placeholder="ID or property value"></label>
+          <label>Node type <select id="graph-type"><option value="">All node types</option></select></label>
+          <label>Relationship <select id="graph-edge-type"><option value="">All relationships</option></select></label>
+          <label>Direction <select id="graph-direction">
+            <option value="both">Incoming + outgoing</option><option value="out">Outgoing</option><option value="in">Incoming</option>
+          </select></label>
+          <label>Neighbor type <select id="graph-neighbor-type"><option value="">Any neighbor type</option></select></label>
+          <label>Min edges <input id="graph-min-degree" type="number" min="0" step="1" value="0" required></label>
+          <label>Min distinct neighbors <input id="graph-min-neighbors" type="number" min="0" step="1" value="0" required></label>
+          <label>Min relationship types <input id="graph-min-edge-types" type="number" min="0" step="1" value="0" required></label>
+          <label>Sort by <select id="graph-sort">
+            <option value="degree">Most edges</option><option value="neighbors">Most neighbors</option>
+            <option value="edge_types">Most relationship types</option><option value="id">Node ID</option>
+          </select></label>
+          <button id="graph-search-btn" type="submit" class="primary">Find nodes</button>
+        </div>
+        <p class="muted small">Counts use matching edges across the whole graph, not just the canvas. Parallel edges count separately; distinct neighbors exclude self-links. Relationship, direction, and neighbor filters also apply at each expansion hop. Minimum counts filter starting nodes only. Shortcuts reset other filters.</p>
+      </form>
       <div class="grid graph">
-        <div class="card list" id="graph-results" aria-label="Search results"></div>
+        <div class="card graph-results-card">
+          <h2>Starting nodes</h2>
+          <p id="graph-search-status" class="muted small" role="status" aria-live="polite"></p>
+          <div class="list" id="graph-results" aria-label="Search results"></div>
+        </div>
         <div class="card graph-canvas-card">
+          <p id="graph-view-status" class="muted small" role="status">Select a starting node to explore its neighborhood.</p>
           <div id="cy" role="img" aria-label="Graph visualization; a text alternative follows"></div>
         </div>
         <div class="card" id="graph-detail"><p class="muted">Search, then select a node to load its neighborhood.</p></div>

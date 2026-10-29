@@ -6,6 +6,7 @@ Global routes live under ``/api`` and workspace-scoped routes under ``/api/w/{wo
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 import threading
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .adapters import create_adapter
+from .adapters.base import UnknownObject
 from .agent.runner import ACTIVE_STATES, DiscoveryRunner
 from .codegen import CodegenError, generate, list_generated
 from .confidence import ensure_confidence
@@ -39,13 +41,14 @@ from .config import (
     set_active_workspace,
     workspaces_dir,
 )
-from .graph import GraphFormatError, GraphRepository
-from .mappings import revalidation_issues
-from .store import ConflictError, Store, read_json
+from .graph import Direction, GraphFormatError, GraphRepository, GraphSort
+from .mappings import build_spec, revalidation_issues
+from .store import ConflictError, Store, read_json, short_hash
 from .topology import load_workspace_topology
 from .workspaces import create_workspace, describe_all, describe_workspace
 
 STATIC_DIR = Path(__file__).parent / "ui" / "static"
+logger = logging.getLogger(__name__)
 
 
 class RunRequest(BaseModel):
@@ -78,6 +81,15 @@ class DecisionRequest(BaseModel):
 class CodegenRequest(BaseModel):
     source: str
     allow_stale: bool = False
+    exclude_fact_ids: list[str] = Field(default_factory=list)
+
+
+class FactRevalidationRequest(BaseModel):
+    reviewer: str = Field(min_length=1, max_length=200)
+    notes: str = Field(min_length=1, max_length=5000)
+    expected_token: str = Field(min_length=1)
+    expected_topology_version: str = Field(min_length=1)
+    confirm_meaning: bool = False
 
 
 class WorkspaceRequest(BaseModel):
@@ -329,24 +341,108 @@ def create_app(root: Path | None = None) -> FastAPI:
         if source not in s.sources:
             raise HTTPException(400, f"Unknown source '{source}'")
         topo = load_workspace_topology(s, strict=False)
+        facts = ctx.store.list_facts(source)
         adapter = None
         try:
             adapter = create_adapter(s, s.source(source))
-        except Exception:  # noqa: BLE001
-            adapter = None
+        except Exception:
+            logger.exception("Cannot reach source %s for fact revalidation", source)
         try:
-            issues = {f["id"]: revalidation_issues(f, topo, adapter) for f in ctx.store.list_facts(source)}
+            issues = {f["id"]: revalidation_issues(f, topo, adapter) for f in facts}
+            spec = build_spec(facts, topo, source, adapter, allow_stale=True)
+            validations = {}
+            for fact in facts:
+                supported = fact["kind"] in ("node_mapping", "edge_mapping")
+                errors = [*spec.fact_errors.get(fact["id"], []), *(issue.message for issue in topo.errors)]
+                if supported and adapter is not None:
+                    for table in fact.get("schema_fingerprints", {}):
+                        try:
+                            adapter.schema_fingerprint(table)
+                        except UnknownObject as exc:
+                            errors.append(str(exc))
+                validations[fact["id"]] = {
+                    "token": short_hash(fact),
+                    "errors": errors,
+                    "needs_revalidation": supported and bool(issues[fact["id"]]),
+                    "can_revalidate": adapter is not None and topo.is_valid and supported and not errors,
+                }
         finally:
             if adapter:
                 adapter.close()
-        return {"source_reachable": adapter is not None, "issues": {k: v for k, v in issues.items() if v}}
+        return {
+            "source_reachable": adapter is not None,
+            "topology_version": topo.version,
+            "issues": {k: v for k, v in issues.items() if v},
+            "validations": validations,
+            "facts": facts,
+        }
+
+    @ws.post("/facts/{fact_id}/revalidate")
+    def revalidate_fact(fact_id: str, body: FactRevalidationRequest, ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
+        if not body.confirm_meaning:
+            raise HTTPException(400, "Confirm that you reviewed the mapping's meaning against the current topology")
+        if not body.reviewer.strip() or not body.notes.strip():
+            raise HTTPException(400, "Reviewer and review notes are required")
+        try:
+            fact = ctx.store.get_fact(fact_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if fact is None:
+            _not_found(fact_id)
+        if fact["kind"] not in ("node_mapping", "edge_mapping"):
+            raise HTTPException(422, "Only node and relationship mappings require code-generation revalidation")
+        topo = load_workspace_topology(ctx.settings, strict=False)
+        if body.expected_token != short_hash(fact) or body.expected_topology_version != topo.version:
+            raise HTTPException(409, "The fact or topology changed during review. Reload and review again.")
+        if not topo.is_valid:
+            raise HTTPException(422, "Fix the invalid topology before revalidating approved mappings")
+        source = fact["source"]
+        if source not in ctx.settings.sources:
+            raise HTTPException(400, f"Unknown source '{source}'")
+        facts = ctx.store.list_facts(source)
+        source_token = short_hash(facts)
+        adapter = None
+        try:
+            adapter = create_adapter(ctx.settings, ctx.settings.source(source))
+            spec = build_spec(facts, topo, source, adapter, allow_stale=True)
+            errors = spec.fact_errors.get(fact_id, [])
+            if errors:
+                return JSONResponse(status_code=422, content={"errors": errors})
+            tables = set(fact.get("schema_fingerprints", {}))
+            tables.add(fact["mapping"]["source_table"])
+            fingerprints = {table: adapter.schema_fingerprint(table) for table in sorted(tables)}
+        except UnknownObject as exc:
+            return JSONResponse(status_code=422, content={"errors": [str(exc)]})
+        except Exception as exc:
+            logger.exception("Cannot validate source %s for fact %s", source, fact_id)
+            raise HTTPException(503, "Source validation failed. Check source access and retry; no approval was changed.") from exc
+        finally:
+            if adapter is not None:
+                adapter.close()
+        if load_workspace_topology(ctx.settings, strict=False).version != topo.version:
+            raise HTTPException(409, "The topology changed during validation. Reload and review again.")
+        try:
+            return ctx.store.revalidate_fact(
+                fact_id, topology_version=topo.version, schema_fingerprints=fingerprints,
+                reviewer=body.reviewer, notes=body.notes, expected_token=body.expected_token,
+                expected_source_token=source_token,
+            )
+        except ConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except KeyError:
+            _not_found(fact_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @ws.post("/codegen")
     def codegen(body: CodegenRequest, ctx: WorkspaceContext = Depends(workspace_ctx)):
         if body.source not in ctx.settings.sources:
             raise HTTPException(400, f"Unknown source '{body.source}'")
         try:
-            return generate(ctx.settings, body.source, allow_stale=body.allow_stale, store=ctx.store)
+            return generate(
+                ctx.settings, body.source, allow_stale=body.allow_stale, store=ctx.store,
+                exclude_fact_ids=body.exclude_fact_ids,
+            )
         except CodegenError as exc:
             return JSONResponse(status_code=422, content={"errors": exc.errors, "warnings": exc.warnings})
 
@@ -416,14 +512,24 @@ def create_app(root: Path | None = None) -> FastAPI:
 
     @ws.get("/graphs/{name}/search")
     def graph_search(name: str, q: str = "", type: str | None = None, limit: int = Query(50, ge=1, le=500),
+                     edge_type: str | None = None, direction: Direction = "both", neighbor_type: str | None = None,
+                     min_degree: int = Query(0, ge=0), min_neighbors: int = Query(0, ge=0),
+                     min_edge_types: int = Query(0, ge=0), sort: GraphSort = "source",
                      ctx: WorkspaceContext = Depends(workspace_ctx)) -> list[dict]:
-        return _graph(ctx, name).search(q, type, limit)
+        return _graph(ctx, name).search(
+            q, type, limit, edge_type=edge_type, direction=direction, neighbor_type=neighbor_type,
+            min_degree=min_degree, min_neighbors=min_neighbors, min_edge_types=min_edge_types, sort=sort,
+        )
 
     @ws.get("/graphs/{name}/neighborhood")
     def graph_neighborhood(name: str, node_id: str, depth: int = Query(1, ge=1, le=3), limit: int = Query(150, ge=1, le=1000),
+                           edge_type: str | None = None, direction: Direction = "both", neighbor_type: str | None = None,
                            ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
         try:
-            return _graph(ctx, name).neighborhood(node_id, depth, limit)
+            return _graph(ctx, name).neighborhood(
+                node_id, depth, limit, [edge_type] if edge_type else None,
+                direction=direction, neighbor_type=neighbor_type,
+            )
         except KeyError:
             _not_found(node_id)
 

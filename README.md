@@ -184,6 +184,58 @@ In the UI, with **mydata** selected:
 4. **Dictionary**: select **Profile columns**, then document tables and columns (see [Data Dictionary](#data-dictionary)).
 5. **Graph**: search and explore.
 
+### Recover from blocked code generation
+
+The **Facts & Code** tab distinguishes old approvals from invalid mappings:
+
+* An old approval means the graph definition or source schema changed since
+  review. Select **Review old approval**, read the mapping and its limitations,
+  enter your name and review notes, and confirm only if its business meaning
+  is still correct. **Validate and confirm approval** checks source columns,
+  schema, and endpoint ID structure before recording a new fact revision.
+* An invalid mapping, such as a relationship supplying one ID part for a node
+  with a two-part ID, cannot be fixed by renewing an approval. Review a corrected
+  mapping, or uncheck **Include** on that fact to leave it out of this build.
+  Excluding a node mapping can also require excluding its dependent relationships.
+
+Revalidation preserves the original approval, evidence, and previous versions
+in a review history. It does not rerun profiling, uniqueness checks, or joins,
+and structural compatibility does not prove business meaning. Source access
+is required; concurrent changes require you to reload and review again.
+
+Build exclusions never delete or retire approved facts. They apply to the
+requested builder and are recorded in its manifest and warnings. Nothing is
+excluded automatically. Recheck the selection when you reload or switch sources.
+Generate again after resolving the blockers to get the smaller, selected graph.
+
+**Bypass old-approval warnings** is an explicit override, not revalidation.
+It cannot fix missing endpoint mappings or incompatible IDs.
+The CLI also supports repeated `--exclude-fact FACT_ID` options on `ddg generate`.
+
+### Find connected nodes
+
+The **Graph** tab ranks starting nodes by their connectivity across the whole
+generated graph, not just the nodes currently displayed. Use **2+ edges** for
+branching records, **Hubs: 5+ neighbors** for nodes connected to many distinct
+records, or **2+ relationship types** for nodes with varied relationships.
+Shortcuts reset the other search filters.
+
+Combine node text/type searches with a relationship type, incoming/outgoing
+direction, neighbor type, and minimum edge, neighbor, or relationship-type counts.
+Sort by most edges, most neighbors, most relationship types, or node ID.
+Counts and ranking use edges matching the selected filters. Parallel edges
+count separately; distinct neighbors exclude self-links.
+
+Select a result to load its neighborhood. Relationship, direction, and neighbor
+filters apply at each expansion hop; minimum counts only filter starting nodes.
+Use **Depth** to explore up to three hops, **Fit view** to recenter the canvas,
+and the text view to inspect nodes and edges without the visualization library.
+Search displays at most 100 results and each neighborhood request is limited
+to 200 nodes, with a visible notice when either limit is reached.
+
+A graph with no edges shows an explicit warning. Filters cannot recover edges
+that were not generated or were skipped because their endpoint nodes were missing.
+
 ## Data Dictionary
 
 The **Dictionary** tab shows everything known about each table and column in one place, and you can start using it before writing a topology.

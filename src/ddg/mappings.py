@@ -130,6 +130,12 @@ class BuildSpec:
     fact_versions: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    fact_errors: dict[str, list[str]] = field(default_factory=dict)
+
+    def add_fact_errors(self, fact_id: str, problems: list[str]) -> None:
+        """Keep actionable per-fact errors alongside the CLI-compatible flat list."""
+        self.fact_errors.setdefault(fact_id, []).extend(problems)
+        self.errors.extend(f"{fact_id}: {problem}" for problem in problems)
 
     @property
     def ok(self) -> bool:
@@ -167,6 +173,7 @@ def build_spec(
 ) -> BuildSpec:
     spec = BuildSpec(source=source, topology_version=topology.version)
     key_arity: dict[str, int] = {}
+    key_columns: dict[str, list[str]] = {}
     for fact in facts:
         if fact.get("source") != source or fact.get("kind") not in ("node_mapping", "edge_mapping"):
             continue
@@ -179,24 +186,31 @@ def build_spec(
         if fact["kind"] == "node_mapping":
             problems = validate_node_mapping(mapping, topology, adapter)
             if problems:
-                spec.errors.extend(f"{fact['id']}: {p}" for p in problems)
+                spec.add_fact_errors(fact["id"], problems)
                 continue
             node = normalize_node_mapping(mapping, topology)
             node["fact_id"] = fact["id"]
             arity = len(node["key_columns"])
             if key_arity.setdefault(node["node_type"], arity) != arity:
-                spec.errors.append(f"{fact['id']}: key arity {arity} conflicts with other mappings for {node['node_type']}")
+                spec.add_fact_errors(fact["id"], [
+                    f"This {node['node_type']} mapping uses {arity} ID parts, but another approved mapping "
+                    f"uses {key_arity[node['node_type']]}. Review the entity identity before including both."
+                ])
                 continue
+            key_columns.setdefault(node["node_type"], node["key_columns"])
             spec.nodes.append(node)
         else:
             problems = validate_edge_mapping(mapping, topology, adapter)
             if problems:
-                spec.errors.extend(f"{fact['id']}: {p}" for p in problems)
+                spec.add_fact_errors(fact["id"], problems)
                 continue
             edge = normalize_edge_mapping(mapping, topology)
             edge["fact_id"] = fact["id"]
             spec.edges.append(edge)
-        spec.fact_versions.append({"fact_id": fact["id"], "candidate_id": fact["candidate_id"], "candidate_version": fact["candidate_version"]})
+        spec.fact_versions.append({
+            "fact_id": fact["id"], "candidate_id": fact["candidate_id"],
+            "candidate_version": fact["candidate_version"], "fact_revision": fact.get("revision", 1),
+        })
 
     mapped_types = {n["node_type"] for n in spec.nodes}
     for edge in spec.edges:
@@ -205,13 +219,21 @@ def build_spec(
             ("to", edge["to_node_type"], edge["to_key_columns"]),
         ):
             if node_type not in mapped_types:
-                spec.errors.append(
-                    f"{edge['fact_id']}: edge {edge['edge_type']} needs an approved node mapping for '{node_type}' ({side} endpoint)"
-                )
+                spec.add_fact_errors(edge["fact_id"], [
+                    f"edge {edge['edge_type']} needs an approved node mapping for '{node_type}' ({side} endpoint). "
+                    "Approve a valid node mapping first, or leave this relationship out of this build."
+                ])
             elif key_arity.get(node_type) != len(keys):
-                spec.errors.append(
-                    f"{edge['fact_id']}: {side}_key_columns has {len(keys)} columns but {node_type} keys have {key_arity.get(node_type)}"
-                )
+                endpoint = "starting" if side == "from" else "ending"
+                spec.add_fact_errors(edge["fact_id"], [
+                    f"Relationship '{edge['edge_type']}' cannot identify its {node_type} {endpoint} node: "
+                    f"{side}_key_columns supplies {len(keys)} ID part(s) ({', '.join(keys)}), "
+                    f"but approved {node_type} IDs need {key_arity[node_type]} "
+                    f"(for example {' + '.join(key_columns[node_type])}). "
+                    "The relationship must supply the same ID parts in the same order. "
+                    "Review a corrected mapping, or leave this relationship out of this build; "
+                    "revalidating an old approval cannot repair missing ID parts."
+                ])
     if not spec.nodes:
         spec.errors.append(f"No approved node mappings for source '{source}'. Approve candidates before generating code.")
     for node_type in topology.node_types:

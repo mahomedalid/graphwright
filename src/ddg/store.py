@@ -262,6 +262,7 @@ class Store:
             "id": "fact-" + candidate["id"].removeprefix("cand-"),
             "candidate_id": candidate["id"],
             "candidate_version": candidate["version"],
+            "revision": 1,
             "kind": candidate["kind"],
             "hypothesis": candidate["hypothesis"],
             "mapping": candidate.get("mapping"),
@@ -287,6 +288,39 @@ class Store:
                 facts.append(data)
         facts.sort(key=lambda f: f.get("approved_at", ""))
         return facts
+
+    def get_fact(self, fact_id: str) -> dict | None:
+        """Read an approved fact without allowing paths outside the fact directory."""
+        if not fact_id.startswith("fact-") or not fact_id.replace("-", "").isalnum():
+            raise ValueError("Invalid fact id")
+        return read_json(self.settings.approved_dir / f"{fact_id}.json")
+
+    def revalidate_fact(
+        self, fact_id: str, *, topology_version: str, schema_fingerprints: dict[str, str],
+        reviewer: str, notes: str, expected_token: str, expected_source_token: str,
+    ) -> dict:
+        """Persist a confirmed structural revalidation without overwriting approval or evidence history."""
+        if not reviewer.strip() or not notes.strip():
+            raise ValueError("Reviewer and review notes are required")
+        with file_lock(self._lock_path):
+            fact = self.get_fact(fact_id)
+            if fact is None:
+                raise KeyError(fact_id)
+            if short_hash(fact) != expected_token or short_hash(self.list_facts(fact["source"])) != expected_source_token:
+                raise ConflictError("Approved facts changed during review. Reload the facts and check again.")
+            record = {
+                "reviewer": reviewer.strip(), "notes": notes.strip(), "at": utcnow(),
+                "previous_topology_version": fact.get("topology_version"),
+                "previous_schema_fingerprints": fact.get("schema_fingerprints", {}),
+                "topology_version": topology_version, "schema_fingerprints": schema_fingerprints,
+                "scope": "mapping, source schema, and endpoint structure; data evidence not rerun",
+            }
+            fact["revalidations"] = [*fact.get("revalidations", []), record]
+            fact["revision"] = fact.get("revision", 1) + 1
+            fact["topology_version"] = topology_version
+            fact["schema_fingerprints"] = schema_fingerprints
+            atomic_write_json(self.settings.approved_dir / f"{fact_id}.json", fact)
+            return fact
 
     def reconcile(self) -> list[str]:
         """Repair candidates whose fact was written but whose status update was interrupted."""
@@ -323,7 +357,8 @@ class Store:
             "facts": facts,
         }
         snapshot["version"] = short_hash(
-            [(c["id"], c["version"]) for c in candidates] + [(f["id"], f["candidate_version"]) for f in facts]
+            [(c["id"], c["version"]) for c in candidates]
+            + [(f["id"], f["candidate_version"], f.get("revision", 1)) for f in facts]
         )
         return snapshot
 
