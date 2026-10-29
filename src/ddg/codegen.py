@@ -1,7 +1,7 @@
 """Generate inspectable graph-building code from approved mappings (FR-009).
 
 The product only writes the code. A human reviews and runs it separately; the
-resulting JSON (``ddg-graph/v1``) is what the UI visualizer loads.
+resulting JSON (``ddg-graph/v1``) or SQLite snapshot is what the UI visualizer loads.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import __version__, transforms
+from . import __version__, graph_exports, transforms
 from .adapters import create_adapter
 from .config import Settings
 from .mappings import BuildSpec, build_spec
@@ -41,7 +41,9 @@ The Data Discovery Graph product never executes this file. Run it yourself:
 Databricks mode needs `pip install databricks-sql-connector` and DATABRICKS_HOST
 (or DATABRICKS_SERVER_HOSTNAME). DATABRICKS_HTTP_PATH defaults to the discovery
 warehouse. With DATABRICKS_TOKEN set it uses that token; otherwise it opens a
-browser OAuth sign-in. Use read-only credentials. Output format: __FORMAT__ (JSON), optional GraphML.
+browser OAuth sign-in. Use read-only credentials. Output format: __FORMAT__ (JSON).
+Optional exports: --sqlite-out graph_output/graph.sqlite, --cypher graph_output/graph.cypher,
+and --graphml graph_output/graph.graphml. Omit --out for export-only builds.
 """
 
 import argparse
@@ -57,6 +59,10 @@ SPEC = json.loads(r"""__SPEC_JSON__""")
 # ---- key transforms (copied from ddg.transforms so discovery and build agree) ----
 __TRANSFORMS__
 # ---- end transforms ----
+
+# ---- standalone graph exporters ----
+__EXPORTERS__
+# ---- end exporters ----
 
 
 def _quote(dialect, identifier):
@@ -224,20 +230,35 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Build the business graph from source tables.")
     parser.add_argument("--sqlite", help="Path to the SQLite source database")
     parser.add_argument("--databricks", action="store_true", help="Read from Databricks SQL")
-    parser.add_argument("--out", required=True, help="Output JSON path (load it in the UI visualizer)")
+    parser.add_argument("--out", help="Output JSON path (load it in the UI visualizer)")
+    parser.add_argument("--sqlite-out", help="Output SQLite graph database (load it in the UI visualizer)")
+    parser.add_argument("--cypher", help="Output Neo4j 5+ Cypher import script")
     parser.add_argument("--graphml", help="Optional GraphML output path")
     args = parser.parse_args(argv)
+    outputs = [Path(p).resolve() for p in (args.out, args.sqlite_out, args.cypher, args.graphml) if p]
+    if not outputs:
+        parser.error("Provide at least one of --out, --sqlite-out, --cypher, or --graphml")
+    if len(set(outputs)) != len(outputs):
+        parser.error("Output paths must be different")
+    if args.sqlite and Path(args.sqlite).resolve() in outputs:
+        parser.error("An output path must not overwrite the source database")
     conn, dialect = connect(args)
     try:
         graph = build_graph(conn, dialect)
     finally:
         conn.close()
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as handle:
-        json.dump(graph, handle, indent=2)
+    for path in outputs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump(graph, handle, indent=2)
+    if args.sqlite_out:
+        write_sqlite(graph, args.sqlite_out)
+    if args.cypher:
+        write_cypher(graph, args.cypher)
     if args.graphml:
         write_graphml(graph, args.graphml)
-    print("Wrote %d nodes and %d edges to %s" % (graph["stats"]["nodes"], graph["stats"]["edges"], args.out))
+    print("Wrote %d nodes and %d edges to %s" % (graph["stats"]["nodes"], graph["stats"]["edges"], ", ".join(map(str, outputs))))
 
 
 if __name__ == "__main__":
@@ -287,6 +308,7 @@ def render(spec: BuildSpec, source_cfg_options: dict, filename: str, generated_a
         .replace("__FILENAME__", filename)
         .replace("__FORMAT__", GRAPH_FORMAT)
         .replace("__TRANSFORMS__", _transforms_source())
+        .replace("__EXPORTERS__", inspect.getsource(graph_exports))
         .replace("__SPEC_JSON__", spec_json)
     )
 
@@ -342,22 +364,27 @@ def generate(
         "excluded_fact_ids": sorted(excluded),
         "warnings": spec.warnings,
         "suggested_command": _suggested_command(settings, source_cfg, path),
+        "suggested_commands": {
+            output: _suggested_command(settings, source_cfg, path, output=output)
+            for output in ("json", "sqlite", "cypher")
+        },
     }
     atomic_write_json(path.with_suffix(".manifest.json"), manifest)
     return {"path": str(path), "code": code, **manifest}
 
 
-def _suggested_command(settings: Settings, source_cfg, path: Path) -> str:
+def _suggested_command(settings: Settings, source_cfg, path: Path, *, output: str = "json") -> str:
     """Command a human runs from the repository root; paths use forward slashes for portability."""
 
     def rel(p: Path) -> str:
         return p.resolve().relative_to(settings.root).as_posix()
 
-    out = settings.graph_output_dir / f"{source_cfg.name}.graph.json"
+    out = settings.graph_output_dir / f"{source_cfg.name}.graph.{output}"
+    flag = {"json": "--out", "sqlite": "--sqlite-out", "cypher": "--cypher"}[output]
     if source_cfg.type == "sqlite":
         db = settings.workspace_dir / source_cfg.options["path"]
-        return f"python {rel(path)} --sqlite {rel(db)} --out {rel(out)}"
-    return f"python {rel(path)} --databricks --out {rel(out)}"
+        return f"python {rel(path)} --sqlite {rel(db)} {flag} {rel(out)}"
+    return f"python {rel(path)} --databricks {flag} {rel(out)}"
 
 
 def list_generated(settings: Settings) -> list[dict]:

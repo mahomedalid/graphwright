@@ -167,7 +167,7 @@
         </div>
         <div class="card">
           <h2>Generated code</h2>
-          <p class="muted small">The product never runs generated code. Review it, then run the suggested command yourself; its JSON output appears in the Graph tab.</p>
+          <p class="muted small">The product never runs generated code. Review it, then choose a command for JSON, SQLite, or Neo4j Cypher. JSON and SQLite outputs appear in the Graph tab; import Cypher into Neo4j separately.</p>
           <div id="codegen-result"></div>
           <h3>Previous builders</h3>
           <ul id="generated-list" class="plain"></ul>
@@ -195,7 +195,7 @@
     <!-- Graph -->
     <section id="tab-graph" role="tabpanel" class="tab hidden">
       <div class="toolbar">
-        <label>Graph file <select id="graph-file"></select></label>
+        <label>Graph dataset <select id="graph-file"></select></label>
         <label>Depth <select id="graph-depth"><option>1</option><option>2</option><option>3</option></select></label>
         <button id="graph-fit-btn">Fit view</button>
         <button id="graph-clear-btn">Clear view</button>

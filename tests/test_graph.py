@@ -4,11 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from ddg.graph import GraphIndex
+from ddg.graph import GraphIndex, GraphRepository
+from ddg.graph_exports import write_sqlite
 
 
-@pytest.fixture
-def graph() -> GraphIndex:
+@pytest.fixture(params=["json", "sqlite"])
+def graph(request, tmp_path) -> GraphIndex:
     nodes = [
         {"id": node_id, "type": node_type, "key": node_id, "properties": {"name": name}}
         for node_id, node_type, name in [
@@ -25,7 +26,12 @@ def graph() -> GraphIndex:
             ("e5", "billed", "B", "C"), ("e6", "loop", "S", "S"),
         ]
     ]
-    return GraphIndex({"format": "ddg-graph/v1", "nodes": nodes, "edges": edges}, Path("test.json"))
+    data = {"format": "ddg-graph/v1", "nodes": nodes, "edges": edges}
+    if request.param == "sqlite":
+        path = tmp_path / "test.sqlite"
+        write_sqlite(data, path)
+        return GraphRepository(tmp_path).get(path.name)
+    return GraphIndex(data, Path("test.json"))
 
 
 def test_given_connected_graph_when_summarizing_then_reports_connectivity(graph):

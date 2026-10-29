@@ -190,3 +190,18 @@ test("a review cannot be opened for a fact no longer present in the current sour
   assert.equal(app.run("state.factReview"), null);
   assert.notEqual(app.get("#fact-revalidation-dialog").open, true);
 });
+
+test("builder commands expose JSON, SQLite and Neo4j choices while preserving older manifests", () => {
+  const app = harness();
+  const choices = app.run(`builderCommands({suggested_commands: {
+    json: "python builder.py --out graph.json",
+    sqlite: "python builder.py --sqlite-out graph.sqlite",
+    cypher: "python builder.py --cypher graph.cypher"
+  }})`);
+
+  assert.match(choices.textContent, /JSON snapshot/);
+  assert.match(choices.textContent, /SQLite graph database/);
+  assert.match(choices.textContent, /Neo4j Cypher import/);
+  assert.match(choices.textContent, /--sqlite-out graph.sqlite/);
+  assert.match(app.run('builderCommands({suggested_command: "legacy command"})').textContent, /legacy command/);
+});

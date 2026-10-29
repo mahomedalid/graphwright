@@ -7,7 +7,7 @@ import pytest
 
 from ddg.agent.runner import DiscoveryRunner
 from ddg.codegen import CodegenError, generate
-from ddg.graph import GraphIndex
+from ddg.graph import GraphIndex, GraphRepository
 
 from conftest import approve_all, retail_db
 
@@ -24,7 +24,9 @@ def _discover_and_approve(settings, store, only=None):
 def _build(settings, script, out):
     db = retail_db(settings)
     completed = subprocess.run(
-        [sys.executable, script, "--sqlite", str(db), "--out", str(out), "--graphml", str(out.with_suffix(".graphml"))],
+        [sys.executable, script, "--sqlite", str(db), "--out", str(out),
+         "--graphml", str(out.with_suffix(".graphml")), "--sqlite-out", str(out.with_suffix(".sqlite")),
+         "--cypher", str(out.with_suffix(".cypher"))],
         capture_output=True, text=True, check=False,
     )
     assert completed.returncode == 0, completed.stderr
@@ -66,6 +68,49 @@ def test_generated_builder_produces_reproducible_graph(settings, store):
     hood = index.neighborhood("Customer:12", depth=2, limit=40)
     assert any(e["type"] == "PLACED" for e in hood["edges"]) and len(hood["nodes"]) <= 40
     assert index.search("example.com", "Customer", limit=5)
+    sql_index = GraphRepository(out_dir).get("a.sqlite")
+    assert sql_index.search("example.com", "Customer", limit=5) == index.search("example.com", "Customer", limit=5)
+    assert sql_index.neighborhood("Customer:12", depth=2, limit=40) == hood
+    cypher = (out_dir / "a.cypher").read_text(encoding="utf-8")
+    assert cypher.count("MERGE (n:DDGNode") == len(first["nodes"])
+    assert cypher.count("MERGE (s)-[r:") == len(first["edges"])
+    assert "--sqlite-out " in result["suggested_commands"]["sqlite"]
+    assert "--cypher " in result["suggested_commands"]["cypher"]
+
+
+@pytest.mark.parametrize("output_flag", ["--sqlite-out", "--cypher", "--graphml"])
+def test_given_export_only_command_when_running_builder_then_does_not_require_json(settings, store, tmp_path, output_flag):
+    _discover_and_approve(settings, store)
+    result = generate(settings, "retail", store=store)
+    output = tmp_path / "nested" / "graph.export"
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-S", result["path"], "--sqlite", str(retail_db(settings)), output_flag, str(output)],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert output.stat().st_size > 0
+
+
+def test_given_conflicting_output_paths_when_running_builder_then_rejects_before_writing(settings, store, tmp_path):
+    _discover_and_approve(settings, store)
+    script = generate(settings, "retail", store=store)["path"]
+    db = retail_db(settings)
+    original = db.read_bytes()
+    output = tmp_path / "graph"
+    commands = [
+        ["--out", str(db)], ["--sqlite-out", str(db)], [],
+        ["--out", str(output), "--cypher", str(output)],
+    ]
+
+    for flags in commands:
+        completed = subprocess.run(
+            [sys.executable, script, "--sqlite", str(db), *flags], capture_output=True, text=True, check=False,
+        )
+        assert completed.returncode == 2
+    assert db.read_bytes() == original
+    assert not output.exists()
 
 
 def test_codegen_blocks_edges_without_node_mappings(settings, store):

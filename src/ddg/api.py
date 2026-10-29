@@ -159,6 +159,10 @@ def create_app(root: Path | None = None) -> FastAPI:
 
     app = FastAPI(title="Data Discovery Graph", version=__version__)
 
+    @app.exception_handler(GraphFormatError)
+    async def graph_format_error(request: Request, exc: GraphFormatError) -> JSONResponse:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
     def require_token(request: Request) -> None:
         if not api_token:
             return

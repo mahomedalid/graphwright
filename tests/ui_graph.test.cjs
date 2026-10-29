@@ -75,6 +75,18 @@ function harness(respond = async () => []) {
   return { calls, errors, get, run: (code) => vm.runInContext(code, context) };
 }
 
+test("graph selector identifies JSON snapshots and SQLite databases", async () => {
+  const app = harness(async () => [
+    {name: "static.json", backend: "json"}, {name: "database.sqlite", backend: "sqlite"},
+  ]);
+  app.run("loadGraphSummary = async () => {}");
+
+  await app.run("loadGraphFiles()");
+
+  assert.match(app.get("#graph-file").textContent, /static.json \(JSON\)/);
+  assert.match(app.get("#graph-file").textContent, /database.sqlite \(SQLite\)/);
+});
+
 test("node search submits connectivity filters and renders matching metrics", async () => {
   const app = harness(async () => [node()]);
   app.get("#graph-min-degree").value = "2";

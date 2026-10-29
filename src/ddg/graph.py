@@ -36,6 +36,12 @@ class GraphIndex:
             for node_id in self.nodes
         }
 
+    def _node(self, node_id: str) -> dict:
+        return self.nodes[node_id]
+
+    def _edge(self, edge_id: str) -> dict:
+        return self.edges[edge_id]
+
     def _matching_edges(
         self, node_id: str, edge_types: list[str] | None = None,
         direction: Direction = "both", neighbor_type: str | None = None,
@@ -135,8 +141,7 @@ class GraphIndex:
         direction: Direction = "both", neighbor_type: str | None = None,
     ) -> dict:
         """Traverse a bounded neighborhood using the same edge filters as node search."""
-        if node_id not in self.nodes:
-            raise KeyError(node_id)
+        self._node(node_id)
         depth = max(1, min(depth, 3))
         seen_nodes = {node_id}
         seen_edges: set[str] = set()
@@ -159,39 +164,49 @@ class GraphIndex:
         return {
             "center": node_id,
             "nodes": [
-                {**self.nodes[n], "connectivity": self._metrics(n, edge_types, direction, neighbor_type)}
+                {**self._node(n), "connectivity": self._metrics(n, edge_types, direction, neighbor_type)}
                 for n in sorted(seen_nodes)
             ],
-            "edges": [self.edges[e] for e in sorted(seen_edges)],
+            "edges": [self._edge(e) for e in sorted(seen_edges)],
             "truncated": truncated,
             "degree": self._metrics(node_id, edge_types, direction, neighbor_type)["degree"],
-            "total_degree": self.connectivity[node_id]["degree"],
+            "total_degree": self._metrics(node_id)["degree"],
         }
 
 
 class GraphRepository:
-    """Caches GraphIndex objects per file, reloading when the file changes."""
+    """Resolve JSON snapshots and read-only SQLite graphs for the same query API."""
 
     def __init__(self, directory: Path):
         self.directory = directory
-        self._cache: dict[str, tuple[float, GraphIndex]] = {}
+        self._cache: dict[str, tuple[tuple[int, int], GraphIndex]] = {}
         self._lock = threading.Lock()
 
     def list(self) -> list[dict]:
         items = []
-        for path in sorted(self.directory.glob("*.json")):
-            items.append({"name": path.name, "size": path.stat().st_size, "modified": path.stat().st_mtime})
+        for path in sorted(self.directory.glob("*")):
+            if not path.is_file() or path.suffix not in (".json", ".sqlite", ".db"):
+                continue
+            items.append({
+                "name": path.name, "size": path.stat().st_size, "modified": path.stat().st_mtime,
+                "backend": "json" if path.suffix == ".json" else "sqlite",
+            })
         return items
 
     def get(self, name: str) -> GraphIndex:
         path = (self.directory / name).resolve()
-        if path.parent != self.directory.resolve() or path.suffix != ".json" or not path.exists():
+        if path.parent != self.directory.resolve() or path.suffix not in (".json", ".sqlite", ".db") or not path.is_file():
             raise FileNotFoundError(name)
-        mtime = path.stat().st_mtime
+        if path.suffix != ".json":
+            from .sqlite_graph import SQLiteGraphIndex
+
+            return SQLiteGraphIndex(path)
+        stat = path.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size)
         with self._lock:
             cached = self._cache.get(name)
-            if cached and cached[0] == mtime:
+            if cached and cached[0] == stamp:
                 return cached[1]
             index = GraphIndex(json.loads(path.read_text(encoding="utf-8")), path)
-            self._cache[name] = (mtime, index)
+            self._cache[name] = (stamp, index)
             return index

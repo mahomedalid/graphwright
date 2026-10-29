@@ -1,10 +1,13 @@
 import json
+import sqlite3
 import time
+from contextlib import closing
 
 import pytest
 from fastapi.testclient import TestClient
 
 from ddg.api import create_app
+from ddg.graph_exports import write_sqlite
 
 
 @pytest.fixture
@@ -131,8 +134,8 @@ def test_given_maximum_iteration_limit_when_starting_then_99_is_accepted(client)
     _wait(client, response.json()["id"])
 
 
-@pytest.fixture
-def explorer_graph(settings):
+@pytest.fixture(params=["json", "sqlite"])
+def explorer_graph(settings, request):
     settings.graph_output_dir.mkdir(parents=True, exist_ok=True)
     graph = {
         "format": "ddg-graph/v1",
@@ -147,8 +150,50 @@ def explorer_graph(settings):
             {"id": "e2", "type": "billing", "source": "A", "target": "C"},
         ],
     }
-    (settings.graph_output_dir / "explorer.json").write_text(json.dumps(graph), encoding="utf-8")
-    return "/api/w/retail/graphs/explorer.json"
+    for node in graph["nodes"]:
+        node.update(key=node["id"], provenance=[])
+    for edge in graph["edges"]:
+        edge.update(properties={}, provenance=[])
+    name = f"explorer.{request.param}"
+    if request.param == "sqlite":
+        write_sqlite(graph, settings.graph_output_dir / name)
+    else:
+        (settings.graph_output_dir / name).write_text(json.dumps(graph), encoding="utf-8")
+    return f"/api/w/retail/graphs/{name}"
+
+
+def test_given_graph_backend_when_listing_and_summarizing_then_uses_same_api(client, explorer_graph):
+    name = explorer_graph.rsplit("/", 1)[1]
+    listing = client.get("/api/w/retail/graphs").json()
+
+    assert listing[0]["name"] == name
+    assert listing[0]["backend"] == name.rsplit(".", 1)[1]
+    summary = client.get(f"{explorer_graph}/summary")
+    assert summary.status_code == 200
+    assert summary.json()["node_count"] == 4 and summary.json()["edge_count"] == 2
+    assert client.get(f"{explorer_graph}/neighborhood", params={"node_id": "missing"}).status_code == 404
+
+
+@pytest.mark.parametrize("damage", ["not-a-database", "missing-table", "invalid-json", "unknown-version"])
+def test_given_invalid_sqlite_graph_when_querying_then_returns_actionable_error(client, settings, damage):
+    path = settings.graph_output_dir / "invalid.sqlite"
+    write_sqlite({"format": "ddg-graph/v1", "nodes": [], "edges": []}, path)
+    if damage == "not-a-database":
+        path.write_text("not a database", encoding="utf-8")
+    else:
+        with closing(sqlite3.connect(path)) as conn, conn:
+            if damage == "missing-table":
+                conn.execute("DROP TABLE nodes")
+            elif damage == "invalid-json":
+                conn.execute("PRAGMA ignore_check_constraints = ON")
+                conn.execute("INSERT INTO graph_metadata VALUES ('stats', 'broken')")
+            else:
+                conn.execute("PRAGMA user_version = 999")
+
+    response = client.get("/api/w/retail/graphs/invalid.sqlite/summary")
+
+    assert response.status_code == 422
+    assert "invalid.sqlite" in response.json()["detail"]
 
 
 def test_given_connectivity_filters_when_searching_graph_then_returns_ranked_nodes(client, explorer_graph):

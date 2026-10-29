@@ -329,7 +329,8 @@ workspace topology + context ──► discovery run (Foundry agent or offline p
                                generated builder (sandbox/generated) ◄─┘
                                          │ run by a human
                                          ▼
-                               graph_output/*.json ──► graph visualizer
+                               graph_output/*.json or *.sqlite ──► graph visualizer
+                                         └─ *.cypher ──► Neo4j (manual import)
 ```
 
 ## Workspaces
@@ -556,7 +557,7 @@ All paths are relative to `workspaces/<name>/`.
 | `metadata/<source>/`          | Source inventory with schema fingerprints                                           |
 | `runs/<run-id>/`              | Run record, checkpoint, evidence files, and correlated events (no raw row contents) |
 | `sandbox/generated/`          | Generated builders and manifests                                                    |
-| `graph_output/`               | Builder output (`ddg-graph/v1` JSON, optional GraphML) loaded by the visualizer     |
+| `graph_output/`               | JSON or SQLite graphs for the visualizer; optional Cypher and GraphML exports         |
 | `dictionary/annotations.json` | SME-curated table and column descriptions, code meanings, notes, and status         |
 | `dictionary/history.jsonl`    | Audit log of dictionary edits (who, when, what)                                     |
 | `dictionary/exports/`         | Generated Markdown and JSON dictionary exports                                      |
@@ -566,6 +567,99 @@ Runtime folders, dictionary exports, and local SQLite files are ignored by Git; 
 ## Graph Output Contract
 
 Generated builders write `ddg-graph/v1` JSON with `inputs` (workspace, source, topology version, fact and candidate versions), `stats`, `warnings`, and sorted `nodes` and `edges`. Node IDs are `<Type>:<canonical key>`. Edge IDs are `<EDGE>:<from>-><to>`, deduplicated by default. Every element lists provenance (fact, table, and row count). Identical inputs produce identical nodes and edges.
+
+### Choose graph storage and export formats
+
+The JSON graph is a static snapshot, not a connection to the source tables. Approved
+mappings produce a standalone Python builder; you review and run it yourself.
+Existing `--out graph.json` commands still work. Newly generated builders also support:
+
+| Builder flag             | Output                                            | Where to use it                  |
+|--------------------------|---------------------------------------------------|----------------------------------|
+| `--out PATH`             | Existing `ddg-graph/v1` JSON snapshot              | Graph tab                        |
+| `--sqlite-out PATH`      | Indexed SQLite graph database                     | Graph tab or your own SQL queries |
+| `--cypher PATH`          | Neo4j 5+ import script, with no APOC dependency    | Import using `cypher-shell`       |
+| `--graphml PATH`         | GraphML                                           | External graph tools             |
+
+Use the JSON, SQLite, or Neo4j command shown under **Generated code** and **Previous
+builders**. You can combine output flags to build multiple formats from the same
+source read, or omit `--out` for a SQLite-only or Cypher-only build. At least one
+output is required. Output paths must be different and cannot overwrite the SQLite
+source database. Regenerate older builders to get these flags.
+
+```powershell
+python .\path\to\builder.py --sqlite .\source.sqlite --out .\graph_output\graph.json --sqlite-out .\graph_output\graph.sqlite --cypher .\graph_output\graph.cypher
+cypher-shell -a neo4j://localhost:7687 -u neo4j -f .\graph_output\graph.cypher
+```
+
+In the Graph tab, choose either the JSON or SQLite entry under **Graph dataset**.
+Both use the same search, relationship filters, connectivity rankings, neighborhood
+expansion, and provenance panels. Save outputs under the workspace's `graph_output`
+directory; SQLite files use `.sqlite` or `.db`. Cypher files are not visualizer
+datasets, and this release does not connect the UI directly to Neo4j.
+
+### SQLite graph schema and lifecycle
+
+SQLite stores graph elements in two tables, with a small `graph_metadata` table
+for snapshot-level inputs, statistics, warnings, format, and build time:
+
+| Table   | Identity and relationship columns                   | JSON text columns          |
+|---------|------------------------------------------------------|----------------------------|
+| `nodes` | `system_id`, `id`, `type`, `key`                      | `properties`, `provenance` |
+| `edges` | `system_id`, `id`, `type`, `source`, `target`           | `properties`, `provenance` |
+
+`system_id` is an integer storage surrogate, local to each table and snapshot.
+Use the deterministic, unique `id` for integration and cross-format identity, not
+`system_id`. Node `key` is the canonical business key. Edge `source` and `target`
+reference node `id` with foreign keys. Properties named `id`, `key`, or `system_id`
+remain inside the JSON payload and do not overwrite identity columns.
+
+The database has indexes on node type and edge source, target, and type, with JSON
+validity checks. Its schema version is `PRAGMA user_version = 1`.
+
+```sql
+SELECT id, type, key, json_extract(properties, '$.name') AS name
+FROM nodes
+WHERE type = 'Customer';
+
+SELECT source, type, target, properties
+FROM edges
+WHERE source = 'Customer:12';
+```
+
+The backend uses a read-only transaction per request and performs filtering,
+ranking, and incident-edge lookup in SQL instead of caching the entire database
+in memory. Valid committed database changes are visible on the next request;
+refresh or reselect the dataset to refresh the UI. The source tables are not
+automatically synchronized: rerun the builder to rebuild the snapshot.
+
+Rebuilding SQLite atomically replaces the whole graph, removing obsolete elements.
+It does not incrementally merge or preserve manual edits, and surrogate
+`system_id` values may change. The builder still constructs the graph in memory
+before writing exports; SQLite query support does not make graph generation streaming.
+
+### Neo4j import semantics
+
+Cypher creates a unique `DDGNode.ddg_id` constraint, business-type node labels,
+and directed relationships using the topology's relationship types. It uses
+`MERGE` with deterministic IDs, so rerunning an import does not duplicate nodes,
+parallel relationships, or self-links. Each relationship retains its own `ddg_id`.
+
+Source properties are native Neo4j properties where supported. The reserved
+`ddg_id`, `ddg_type`, and node `ddg_key` fields hold identity.
+`ddg_properties_json` preserves the full original property map, including nulls
+and any properties colliding with reserved names; `ddg_provenance_json` preserves
+provenance. Neo4j does not store nested maps as native properties.
+
+Imports merge into the selected Neo4j database, not a workspace namespace.
+Use separate databases when graphs should remain isolated. Importing updates
+present properties but does not delete elements, old labels, or properties absent
+from a later snapshot. Review the script and import into a dedicated database.
+
+> [!WARNING]
+> Exports contain source property values and provenance. Protect JSON, SQLite,
+> Cypher, and GraphML outputs as source data. Source reads remain read-only;
+> `cypher-shell` performs writes only when you explicitly run the import.
 
 ## Development
 

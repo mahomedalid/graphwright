@@ -591,7 +591,14 @@ async function loadFacts() {
   const list = clear($("#generated-list"));
   for (const g of generated) list.append(h("li", {}, h("code", {}, g.builder), h("div", { className: "small muted" },
     `${fmtTime(g.generated_at)} · ${g.source} · ${g.facts.length} facts · ${g.excluded_fact_ids?.length || 0} left out`),
-    h("code", { className: "small" }, g.suggested_command)));
+    builderCommands(g)));
+}
+
+function builderCommands(builder) {
+  const commands = builder.suggested_commands || { json: builder.suggested_command };
+  const labels = { json: "JSON snapshot", sqlite: "SQLite graph database", cypher: "Neo4j Cypher import" };
+  return h("div", {}, Object.entries(commands).map(([format, command]) =>
+    h("details", {}, h("summary", {}, labels[format] || format), h("pre", {}, command))));
 }
 
 function updateFactSelection(changed = false) {
@@ -655,7 +662,8 @@ async function generateCode() {
     if (workspace !== state.ws || source !== $("#facts-source").value) return;
     appendAll(out, h("p", {}, "Generated ", h("code", {}, result.path)),
       result.warnings.length ? h("ul", { className: "warn" }, result.warnings.map((w) => h("li", {}, w))) : null,
-      h("p", {}, "Review it, then run:"), h("pre", {}, result.suggested_command),
+      h("p", {}, "Review it, then run the command for your output format. You can combine output flags in one run."),
+      builderCommands(result),
       h("details", {}, h("summary", {}, "View code"), h("pre", {}, result.code)));
     loadFacts();
   } catch (e) {
@@ -715,10 +723,10 @@ async function loadGraphFiles() {
     if (!files.length) {
       resetGraphExplorer();
       select.append(h("option", { value: "" }, "No graph output yet"));
-      $("#graph-summary").textContent = "Generate builder code from approved facts, run it, and write its JSON output to graph_output/.";
+      $("#graph-summary").textContent = "Generate builder code from approved facts, run it, and write its JSON or SQLite output to graph_output/.";
       return;
     }
-    files.forEach((f) => select.append(h("option", { value: f.name }, f.name)));
+    files.forEach((f) => select.append(h("option", { value: f.name }, `${f.name} (${f.backend === "sqlite" ? "SQLite" : "JSON"})`)));
     if (current && files.some((f) => f.name === current)) select.value = current;
     await loadGraphSummary();
   } catch (e) {

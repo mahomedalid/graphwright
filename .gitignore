@@ -28,3 +28,4 @@ workspaces/*/dictionary/exports/
 workspaces/*/dictionary/.lock
 workspaces/*/archive/
 workspaces/telecom
+workspaces/rogers
