@@ -9,11 +9,13 @@ Every tool:
 
 from __future__ import annotations
 
+import time
 from collections import Counter
 from typing import Any
 
 from .adapters.base import ReadOnlyViolation, SourceAdapter, UnknownObject, value_shape
-from .config import Settings
+from .confidence import TIER_SCORE, TIERS, assess
+from .config import MODES, Settings
 from .control import RunControl, StopRun
 from .mappings import validate_edge_mapping, validate_node_mapping
 from .privacy import PrivacyGuard
@@ -21,7 +23,8 @@ from .store import ProposalRejected, Store, new_id, utcnow
 from .topology import Topology
 from .transforms import TRANSFORM_NAMES, canonical_key
 
-CANDIDATE_KINDS = ("node_mapping", "edge_mapping", "observation")
+CANDIDATE_KINDS = ("node_mapping", "edge_mapping", "annotation", "observation")
+COMPAT_SAMPLE = 500
 
 
 class ToolError(Exception):
@@ -38,13 +41,19 @@ class DiscoveryTools:
         control: RunControl,
         run_id: str,
         evidence_index: dict[str, dict] | None = None,
+        mode: str = "conservative",
+        independent_samples: bool = False,
     ):
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {', '.join(MODES)}")
         self.settings = settings
         self.store = store
         self.adapter = adapter
         self.topology = topology
         self.control = control
         self.run_id = run_id
+        self.mode = mode
+        self.independent_samples = independent_samples
         self.privacy = PrivacyGuard(settings.sampling)
         self.iteration = 0
         self.evidence_index: dict[str, dict] = dict(evidence_index or {})
@@ -52,21 +61,40 @@ class DiscoveryTools:
         self.proposal_errors: list[str] = []
         self.notes: list[str] = []
         self.inventory: dict[str, dict] = {}
+        # Resumed runs already described these tables; reuse them instead of re-querying.
+        for ev in self.evidence_index.values():
+            if ev.get("tool") == "describe_table" and ev.get("result", {}).get("table"):
+                self.inventory[ev["result"]["table"]] = ev["result"]
 
     # ----- plumbing -----------------------------------------------------
     def _call(self, tool: str, args: dict, fn) -> dict:
         self.control.before_tool()
         call_id = new_id("call")
         before = self.adapter.query_count
+        started = time.monotonic()
+        self.store.append_event(self.run_id, {
+            "type": "tool_started", "iteration": self.iteration, "call_id": call_id, "tool": tool,
+        })
         try:
             result = fn()
             status = "ok"
         except (UnknownObject, ToolError, ReadOnlyViolation, ValueError, TimeoutError) as exc:
             result = {"error": str(exc)}
             status = "error"
-        except StopRun:
+        except StopRun as exc:
+            self.store.append_event(self.run_id, {
+                "type": "tool_failed", "iteration": self.iteration, "call_id": call_id, "tool": tool,
+                "reason": exc.reason, "duration_seconds": round(time.monotonic() - started, 2),
+            })
             raise
-        self.control.usage.queries += self.adapter.query_count - before
+        except Exception as exc:
+            self.store.append_event(self.run_id, {
+                "type": "tool_failed", "iteration": self.iteration, "call_id": call_id, "tool": tool,
+                "error_type": type(exc).__name__, "duration_seconds": round(time.monotonic() - started, 2),
+            })
+            raise
+        finally:
+            self.control.usage.queries += self.adapter.query_count - before
         self.store.append_event(
             self.run_id,
             {
@@ -76,6 +104,7 @@ class DiscoveryTools:
                 "tool": tool,
                 "args": args,
                 "status": status,
+                "duration_seconds": round(time.monotonic() - started, 2),
                 "evidence_id": result.get("evidence_id") if isinstance(result, dict) else None,
                 "summary": _summarize(result),
             },
@@ -113,7 +142,12 @@ class DiscoveryTools:
 
     def describe_table(self, table: str) -> dict:
         def run():
-            info = self.adapter.describe_table(table)
+            resolved = self.adapter.resolve_table(table)
+            cached = self.inventory.get(resolved)
+            if cached and cached.get("evidence_id") in self.evidence_index:
+                # Same run, same table: reuse the earlier result and evidence id instead of querying again.
+                return {**cached, "cached": True}
+            info = self.adapter.describe_table(resolved)
             self.inventory[info["table"]] = info
             return self._evidence("describe_table", {"table": info["table"]}, info, "full")
 
@@ -265,6 +299,124 @@ class DiscoveryTools:
 
         return self._call("check_join", args, run)
 
+    def check_compatibility(
+        self,
+        left_table: str,
+        left_column: str,
+        right_table: str,
+        right_column: str,
+        left_transforms: list[str] | None = None,
+        right_transforms: list[str] | None = None,
+    ) -> dict:
+        """Compare key formats without needing value overlap (works on independently sampled tables).
+
+        Raw values are read internally and never returned: the result has types, value shapes,
+        length ranges, and naming signals only.
+        """
+        args = {"left_table": left_table, "left_column": left_column, "right_table": right_table,
+                "right_column": right_column, "left_transforms": left_transforms, "right_transforms": right_transforms}
+
+        def run():
+            from .agent.heuristic import tokens
+
+            lt, rt = self.adapter.resolve_table(left_table), self.adapter.resolve_table(right_table)
+            lc, rc = self.adapter.resolve_column(lt, left_column), self.adapter.resolve_column(rt, right_column)
+            lchain = _chains([left_transforms] if left_transforms is not None else None, [lc])[0]
+            rchain = _chains([right_transforms] if right_transforms is not None else None, [rc])[0]
+
+            def side(table: str, column: str, chain: list[str]) -> tuple[dict, list[str]]:
+                _, rows = self.adapter.run(
+                    f"SELECT {self.adapter.quote(column)} FROM {self.adapter.qualified(table)} "
+                    f"WHERE {self.adapter.quote(column)} IS NOT NULL LIMIT {COMPAT_SAMPLE}",
+                    COMPAT_SAMPLE,
+                )
+                values = [v for v in (canonical_key([r[0]], [chain]) for r in rows) if v is not None]
+                shapes = Counter(value_shape(v) for v in values)
+                col_type = next((c.get("type") for c in self.adapter.columns(table) if c["name"] == column), None)
+                lengths = [len(v) for v in values]
+                info = {
+                    "table": table, "column": column, "type": col_type, "transforms": chain,
+                    "sampled_values": len(values),
+                    "top_shapes": [{"shape": s, "share": round(n / len(values), 3)} for s, n in shapes.most_common(5)] if values else [],
+                    "length_range": [min(lengths), max(lengths)] if lengths else None,
+                }
+                return info, values
+
+            left, lvals = side(lt, lc, lchain)
+            right, rvals = side(rt, rc, rchain)
+            right_shapes = {value_shape(v) for v in rvals}
+            shape_agreement = (sum(1 for v in lvals if value_shape(v) in right_shapes) / len(lvals)) if lvals else 0.0
+            rset = set(rvals)
+            sample_overlap = (sum(1 for v in lvals if v in rset) / len(lvals)) if lvals else 0.0
+            ref_tokens = set(tokens(rt)) | set(tokens(rc))
+            name_signal = sorted(set(tokens(lc)) & ref_tokens - {"id", "key", "no", "num", "code", "cd"})
+            if not lvals or not rvals:
+                verdict = "unknown"
+            elif shape_agreement >= 0.8:
+                verdict = "compatible"
+            elif shape_agreement >= 0.3:
+                verdict = "partial"
+            else:
+                verdict = "incompatible"
+            result = {
+                "left": left, "right": right, "verdict": verdict,
+                "shape_agreement": round(shape_agreement, 3),
+                "sample_value_overlap": round(sample_overlap, 3),
+                "name_signal": name_signal,
+                "note": "Format compatibility supports, but cannot prove, a relationship. Use check_join for overlap when samples are consistent.",
+            }
+            return self._evidence("check_compatibility", {
+                "left_table": lt, "left_column": lc, "left_transforms": lchain,
+                "right_table": rt, "right_column": rc, "right_transforms": rchain,
+            }, result, "sample")
+
+        return self._call("check_compatibility", args, run)
+
+    def exploration_ledger(self, max_lines: int = 160) -> str:
+        """Compact memory of everything checked in this run (and resumed runs), with citable evidence ids."""
+        attempts, profiles, described = [], [], []
+        for ev in sorted(self.evidence_index.values(), key=lambda e: (e.get("iteration", 0), e.get("observed_at", ""))):
+            r, a, eid = ev.get("result", {}), ev.get("args", {}), ev["id"]
+            tool = ev.get("tool")
+            if tool == "describe_table":
+                pk = [c["name"] for c in r.get("columns", []) if c.get("primary_key")]
+                described.append(f"{eid} describe {r.get('table')}: {r.get('row_count')} rows, {len(r.get('columns', []))} cols"
+                                 + (f", pk={pk}" if pk else ""))
+            elif tool == "check_uniqueness":
+                attempts.append(f"{eid} uniqueness {a.get('table')}{a.get('columns')} tf={a.get('transforms')}: unique={r.get('unique')}, "
+                                f"distinct={r.get('distinct_keys')}, duplicate_keys={r.get('duplicate_keys')}, null_rows={r.get('rows_with_null_key')}")
+            elif tool == "check_join":
+                attempts.append(f"{eid} join {a.get('left_table')}{a.get('left_columns')} tf={a.get('left_transforms')} -> "
+                                f"{a.get('right_table')}{a.get('right_columns')} tf={a.get('right_transforms')}: "
+                                f"rows {r.get('row_coverage', 0):.1%}, keys {r.get('key_coverage', 0):.1%}, "
+                                f"unmatched={r.get('unmatched_left_keys')}, cardinality={r.get('observed_cardinality_left_to_right')}")
+            elif tool == "check_compatibility":
+                attempts.append(f"{eid} compatibility {a.get('left_table')}.{a.get('left_column')} -> {a.get('right_table')}.{a.get('right_column')}: "
+                                f"{r.get('verdict')} (shapes agree {r.get('shape_agreement', 0):.0%}, names share {r.get('name_signal')})")
+            elif tool == "profile_column":
+                shapes = [s["shape"] for s in r.get("value_shapes", [])][:3]
+                profiles.append(f"{eid} profile {a.get('table')}.{a.get('column')}: {r.get('null_count')} nulls of {r.get('row_count')}, "
+                                f"{r.get('distinct_count')} distinct, shapes {shapes}")
+        lines = []
+        if attempts:
+            lines += ["Checks already done (do not repeat; cite these ids):", *attempts]
+        if profiles:
+            lines += ["Column profiles:", *profiles[-40:]]
+        if described:
+            lines += ["Tables described (describe_table again returns the cached result):", *described]
+        if len(lines) > max_lines:
+            lines = lines[:max_lines] + [f"... {len(lines) - max_lines} more lines omitted"]
+        return "\n".join(lines) if lines else "Nothing checked yet in this run."
+
+    def schema_digest(self, max_columns: int = 80) -> str:
+        """Column names of described tables so the agent does not re-describe to recall them."""
+        out = []
+        for name in sorted(self.inventory, key=str.lower):
+            cols = [c["name"] for c in self.inventory[name].get("columns", [])]
+            more = f" (+{len(cols) - max_columns} more)" if len(cols) > max_columns else ""
+            out.append(f"{name}: {', '.join(cols[:max_columns])}{more}")
+        return "\n".join(out) if out else "No tables described yet."
+
     def get_review_feedback(self) -> dict:
         def run():
             snapshot = self.store.review_snapshot()
@@ -284,6 +436,54 @@ class DiscoveryTools:
 
         return self._call("get_review_feedback", {}, run)
 
+    def _validate_annotation(self, mapping: dict) -> list[str]:
+        """Annotation = dictionary knowledge: {table, column?, description?, values?: {code: meaning}, rules?: [..]}."""
+        errors: list[str] = []
+        try:
+            mapping["table"] = self.adapter.resolve_table(str(mapping.get("table", "")))
+            if mapping.get("column"):
+                mapping["column"] = self.adapter.resolve_column(mapping["table"], str(mapping["column"]))
+        except UnknownObject as exc:
+            return [str(exc)]
+        description = mapping.get("description") or ""
+        values = mapping.get("values") or {}
+        rules = mapping.get("rules") or []
+        if not isinstance(description, str) or not isinstance(values, dict) or not isinstance(rules, list):
+            errors.append("description must be text, values an object of code -> meaning, rules a list of text")
+        elif not (description.strip() or values or rules):
+            errors.append("annotation needs a description, values, or rules")
+        if values and not mapping.get("column"):
+            errors.append("values (code meanings) require a column")
+        unknown = set(mapping) - {"table", "column", "description", "values", "rules"}
+        if unknown:
+            errors.append(f"unknown annotation fields {sorted(unknown)}")
+        return errors
+
+    def get_dictionary(self, table: str | None = None) -> dict:
+        """Curated dictionary knowledge (SME edits and approved annotations) for this source."""
+
+        def run():
+            from .dictionary import build_dictionary
+
+            dictionary = build_dictionary(self.settings, self.store, self.adapter.name)
+            out = []
+            for t in dictionary["tables"]:
+                if table and t["name"].lower() != table.lower():
+                    continue
+                cols = [
+                    {k: c[k] for k in ("name", "description", "status", "values", "notes") if c.get(k)}
+                    for c in t["columns"] if c["description"] or c.get("values") or c["notes"]
+                ]
+                if t["description"] or t["notes"] or cols or t["history"]:
+                    out.append({
+                        "table": t["name"], "description": t["description"], "status": t["status"], "notes": t["notes"],
+                        "columns": cols,
+                        "rejected_interpretations": [h["hypothesis"] for h in t["history"]],
+                    })
+            return {"source": self.adapter.name, "tables": out, "summary": dictionary["summary"]}
+
+        return self._call("get_dictionary", {"table": table}, run)
+
     def record_note(self, note: str) -> dict:
         def run():
             self.notes.append(note[:1000])
@@ -301,8 +501,10 @@ class DiscoveryTools:
         limitations: list[str] | None = None,
         confidence: float | None = None,
         new_evidence_note: str | None = None,
+        confidence_tier: str | None = None,
     ) -> dict:
-        args = {"kind": kind, "hypothesis": hypothesis[:200], "evidence_ids": evidence_ids, "mapping": mapping}
+        args = {"kind": kind, "hypothesis": hypothesis[:200], "evidence_ids": evidence_ids, "mapping": mapping,
+                "confidence_tier": confidence_tier}
 
         def run():
             if kind not in CANDIDATE_KINDS:
@@ -330,6 +532,10 @@ class DiscoveryTools:
                     mapping.setdefault("from_node_type", edge.from_type)
                     mapping.setdefault("to_node_type", edge.to_type)
                     tables.add(self.adapter.resolve_table(mapping["source_table"]))
+            elif kind == "annotation":
+                errors = self._validate_annotation(mapping or {})
+                if not errors:
+                    tables.add(mapping["table"])
             if errors:
                 raise ToolError("Invalid mapping: " + "; ".join(errors))
             for ev in evidence:
@@ -340,6 +546,23 @@ class DiscoveryTools:
             if any(ev["scope"] == "sample" for ev in evidence):
                 lims.append("Some supporting evidence is from bounded samples, not full-data checks.")
             lims.append("Model or heuristic confidence is not proof of business meaning; SME validation required.")
+            declared = None
+            if kind == "edge_mapping" and mapping and mapping.get("edge_type") in self.topology.edge_types:
+                declared = self.topology.edge_types[mapping["edge_type"]].cardinality
+            stated = (confidence_tier or "").lower() or None
+            if stated is not None and stated not in TIERS:
+                raise ToolError(f"confidence_tier must be one of {', '.join(TIERS)}")
+            assessment = assess(kind, mapping, evidence, declared_cardinality=declared, stated_tier=stated,
+                                independent_samples=self.independent_samples)
+            if assessment["tier"] == "low" and self.mode != "exploratory":
+                raise ToolError(
+                    "Low-confidence proposal not accepted in conservative mode ("
+                    + "; ".join(assessment["reasons"])
+                    + "). Gather stronger evidence, or record the idea with record_note."
+                )
+            # Keep the legacy numeric score consistent with the tier (a model cannot claim 0.9 for low evidence).
+            cap = {"low": 0.45, "medium": 0.75, "high": 0.95}[assessment["tier"]]
+            numeric = min(float(confidence if confidence is not None else TIER_SCORE[assessment["tier"]]), cap)
             candidate = {
                 "kind": kind,
                 "hypothesis": hypothesis.strip(),
@@ -351,7 +574,11 @@ class DiscoveryTools:
                     for ev in evidence
                 ],
                 "limitations": lims,
-                "confidence": confidence,
+                "confidence": round(numeric, 2),
+                "confidence_tier": assessment["tier"],
+                "confidence_reasons": assessment["reasons"],
+                "evidence_tier": assessment["evidence_tier"],
+                "discovery_mode": self.mode,
                 "source_refs": sorted(f"{self.adapter.name}:{t}" for t in tables),
                 "scope": {"source": self.adapter.name, "tables": sorted(tables)},
                 "schema_fingerprints": {t: self.adapter.schema_fingerprint(t) for t in sorted(tables)},
@@ -366,7 +593,8 @@ class DiscoveryTools:
                 self.proposal_errors.append(str(exc))
                 raise ToolError(str(exc)) from exc
             self.proposed.append(stored)
-            return {"candidate_id": stored["id"], "status": "pending SME review"}
+            return {"candidate_id": stored["id"], "status": "pending SME review",
+                    "confidence_tier": assessment["tier"], "confidence_reasons": assessment["reasons"]}
 
         return self._call("propose_candidate", args, run)
 

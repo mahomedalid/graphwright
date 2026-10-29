@@ -84,14 +84,16 @@ def test_given_references_when_foundry_runs_then_prompt_contains_full_text_and_p
 
     class Agent:
         def __init__(self, client, instruction_text, **kwargs):
+            assert client.function_invocation_configuration["allow_concurrent_invocation"] is False
             instructions.append(instruction_text)
 
-        async def run(self, prompt):
+        async def run(self, prompt, *, client_kwargs):
+            assert client_kwargs["timeout"] > 0
             prompts.append(prompt)
             return SimpleNamespace(text="DONE")
 
     monkeypatch.setattr(azure.identity.aio, "DefaultAzureCredential", Credential)
-    monkeypatch.setattr(agent_framework.foundry, "FoundryChatClient", lambda **kwargs: object())
+    monkeypatch.setattr(agent_framework.foundry, "FoundryChatClient", lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(agent_framework, "Agent", Agent)
     documents = [{"path": "context/prior/notes.md", "content": "Previous findings\n" + "x" * 13_000}]
     ctx = IterationContext(
@@ -103,3 +105,74 @@ def test_given_references_when_foundry_runs_then_prompt_contains_full_text_and_p
     assert result.done
     assert json.dumps(documents, ensure_ascii=False) in prompts[0]
     assert "untrusted background data" in instructions[0]
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "timeout", "middleware_error"])
+def test_given_discovery_model_call_when_middleware_runs_then_progress_and_failures_are_reported(
+    settings, store, monkeypatch, outcome
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    import agent_framework
+    import agent_framework.foundry
+    import azure.identity.aio
+
+    settings.model.project_endpoint = "https://example.services.ai.azure.com/api/projects/demo"
+    settings.model.model = "gpt-test"
+    if outcome == "timeout":
+        settings.limits.max_minutes = 0.001
+    events = []
+    control = RunControl(settings.limits, settings.model, lambda: False, on_event=events.append)
+    tools = _tools(settings, store, control)
+
+    class Credential:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class Agent:
+        def __init__(self, client, instructions, **kwargs):
+            self.client = client
+
+        async def run(self, prompt, *, client_kwargs):
+            context = SimpleNamespace(result=None)
+
+            async def next_call():
+                if outcome == "error":
+                    raise RuntimeError("model invocation failed")
+                if outcome == "middleware_error":
+                    raise agent_framework.MiddlewareFailure("unexpected middleware failure")
+                if outcome == "timeout":
+                    await asyncio.sleep(10)
+                context.result = SimpleNamespace(usage_details={"input_token_count": 123, "output_token_count": 45})
+
+            await self.client.middleware[0].process(context, next_call)
+            return SimpleNamespace(text="DONE")
+
+    monkeypatch.setattr(azure.identity.aio, "DefaultAzureCredential", Credential)
+    monkeypatch.setattr(agent_framework.foundry, "FoundryChatClient", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(agent_framework, "Agent", Agent)
+    ctx = IterationContext(1, "retail", load_topology(settings.topology_file), store.review_snapshot(), {})
+    planner = FoundryPlanner(settings, control)
+
+    if outcome == "success":
+        assert planner.run_iteration(ctx, tools).done
+        assert events[-1]["type"] == "model_call_completed"
+        assert events[-1]["usage"]["input_tokens"] == 123
+    elif outcome == "error":
+        with pytest.raises(RuntimeError, match="model invocation failed"):
+            planner.run_iteration(ctx, tools)
+        assert events[-1]["error_type"] == "RuntimeError"
+    elif outcome == "middleware_error":
+        with pytest.raises(agent_framework.MiddlewareFailure, match="unexpected"):
+            planner.run_iteration(ctx, tools)
+    else:
+        with pytest.raises(StopRun) as error:
+            planner.run_iteration(ctx, tools)
+        assert error.value.reason == "time_limit"
+        assert events[-1]["reason"] == "time_limit"
+    assert events[0]["type"] == "model_call_started"
+    assert control.usage.model_calls == 1

@@ -2,6 +2,7 @@ from ddg.agent.runner import DiscoveryRunner
 
 
 def _run(settings, store, **limits):
+    limits.setdefault("max_iterations", 20)
     runner = DiscoveryRunner(settings, store)
     run = runner.create_run("retail", "heuristic", limits or None)
     return runner, runner.execute(run["id"])
@@ -63,7 +64,7 @@ def test_iteration_limit_and_checkpoint_resume(settings, store):
     runner, first = _run(settings, store, max_iterations=2)
     assert first["termination_reason"] == "iteration_limit"
     assert store.load_checkpoint(first["id"])["iteration"] == 2
-    resumed = runner.create_run("retail", "heuristic", resume_from=first["id"])
+    resumed = runner.create_run("retail", "heuristic", {"max_iterations": 20}, resume_from=first["id"])
     result = runner.execute(resumed["id"])
     assert result["resumed_from"] == first["id"]
     assert result["iterations"][0]["iteration"] == 3
@@ -99,3 +100,42 @@ def test_invalid_topology_fails_before_discovery(settings, store):
     assert run["status"] == "failed" and run["termination_reason"] == "invalid_topology"
     assert "No node types defined" in run["error"]
     assert run["usage"]["queries"] == 0
+
+
+def test_given_default_settings_when_running_then_run_stops_after_three_iterations(settings, store):
+    runner = DiscoveryRunner(settings, store)
+
+    run = runner.execute(runner.create_run("retail", "heuristic")["id"])
+
+    assert run["limits"]["max_iterations"] == 3
+    assert len(run["iterations"]) == 3
+    assert run["termination_reason"] == "iteration_limit"
+
+
+def test_given_run_when_executing_then_startup_and_tool_progress_are_visible(settings, store):
+    runner = DiscoveryRunner(settings, store)
+
+    run = runner.execute(runner.create_run("retail", "heuristic")["id"])
+    events = store.read_events(run["id"])
+
+    types = [event["type"] for event in events]
+    assert types.index("run_started") < types.index("topology_loading") < types.index("topology_loaded")
+    assert types.index("source_connecting") < types.index("source_connected") < types.index("iteration_started")
+    starts = {event["call_id"] for event in events if event["type"] == "tool_started"}
+    completions = [event for event in events if event["type"] == "tool"]
+    assert starts == {event["call_id"] for event in completions}
+    assert all(event["duration_seconds"] >= 0 for event in completions)
+
+
+def test_given_cancelled_resume_before_startup_when_resuming_again_then_prior_checkpoint_is_preserved(settings, store):
+    runner, initial = _run(settings, store, max_iterations=2)
+    resumed = runner.create_run("retail", "heuristic", resume_from=initial["id"])
+    store.request_cancel(resumed["id"])
+
+    cancelled = runner.execute(resumed["id"])
+    checkpoint = store.load_checkpoint(cancelled["id"])
+
+    assert cancelled["status"] == "cancelled"
+    assert checkpoint["iteration"] == 2
+    assert checkpoint["memory"] == store.load_checkpoint(initial["id"])["memory"]
+    assert checkpoint["topology_version"] == initial["topology_version"]

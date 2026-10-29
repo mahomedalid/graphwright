@@ -32,6 +32,11 @@ import hashlib
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .config import Settings
+    from .control import RunControl
 
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 CARDINALITIES = {"one-to-one", "one-to-many", "many-to-one", "many-to-many"}
@@ -87,6 +92,7 @@ class Topology:
     hints: list[str]
     issues: list[Issue]
     source_path: str = ""
+    parsing_mode: str = "structured"
 
     @property
     def errors(self) -> list[Issue]:
@@ -111,6 +117,7 @@ class Topology:
             "hints": self.hints,
             "issues": [asdict(i) for i in self.issues],
             "is_valid": self.is_valid,
+            "parsing_mode": self.parsing_mode,
         }
 
     def summary_for_agent(self) -> str:
@@ -265,4 +272,92 @@ def load_topology(path: Path, *, strict: bool = True) -> Topology:
     topology = parse_topology(path.read_text(encoding="utf-8"), source_path=str(path))
     if strict and not topology.is_valid:
         raise TopologyError(topology)
+    return topology
+
+
+def load_workspace_topology(
+    settings: Settings, *, strict: bool = True, resolve: bool = False, control: RunControl | None = None
+) -> Topology:
+    """Load structured or cached topology; explicitly resolve free-form text with Foundry.
+
+    Read-only callers never invoke a model. Successful extractions are cached under
+    metadata and invalidated whenever the original source text changes.
+    """
+    from .store import read_json
+
+    source = load_topology(settings.topology_file, strict=False)
+    topology = source
+    cache_path = settings.metadata_dir / "topology.json"
+    if not source.is_valid and source.version != "none":
+        cached = read_json(cache_path)
+        source_path = str(settings.topology_file.resolve())
+        if cached and cached.get("source_version") == source.version and cached.get("source_path") == source_path:
+            topology = _resolved_topology(cached["markdown"], source)
+        elif resolve and settings.model.configured:
+            topology = _parse_and_cache(settings, source, control)
+        elif settings.model.configured:
+            topology.parsing_mode = "pending_foundry"
+            topology.issues = [
+                Issue("warning" if issue.level == "error" else issue.level, issue.message, issue.line)
+                for issue in topology.issues
+            ]
+            topology.issues.append(Issue(
+                "error", "Free-form topology needs Foundry parsing. Start a discovery run with auto/foundry "
+                "or run 'ddg topology' to parse and validate it."
+            ))
+        else:
+            topology.issues.append(Issue(
+                "error", "Foundry is not configured and the topology is not valid structured Markdown. "
+                "Either set FOUNDRY_PROJECT_ENDPOINT and FOUNDRY_MODEL to parse free-form text, "
+                "or use '## Node Types' / '### TypeName' and '## Edge Types' with From/To fields."
+            ))
+    if strict and not topology.is_valid:
+        raise TopologyError(topology)
+    return topology
+
+
+def _parse_and_cache(settings: Settings, source: Topology, control: RunControl | None) -> Topology:
+    from .agent.topology_parser import parse_with_foundry
+    from .control import RunControl
+    from .store import atomic_write_json, file_lock, read_json
+
+    control = control or RunControl(settings.limits, settings.model, cancel_requested=lambda: False)
+    control.check()
+    cache_path = settings.metadata_dir / "topology.json"
+    source_path = str(settings.topology_file.resolve())
+    control.emit("topology_parse_waiting", message="Waiting for the topology parsing lock.")
+    with file_lock(
+        cache_path.with_suffix(".lock"),
+        timeout=control.remaining_seconds(),
+        stale_after=max(3600.0, settings.limits.max_minutes * 60 + 60),
+    ):
+        cached = read_json(cache_path)
+        if cached and cached.get("source_version") == source.version and cached.get("source_path") == source_path:
+            return _resolved_topology(cached["markdown"], source)
+        text = settings.topology_file.read_text(encoding="utf-8")
+        control.emit("topology_parse_started", characters=len(text))
+        if parse_topology(text).version != source.version:
+            raise ValueError("Topology changed before Foundry parsing; retry with the updated document")
+        markdown = parse_with_foundry(text, settings, control)
+        topology = _resolved_topology(markdown, source)
+        if not topology.is_valid:
+            raise TopologyError(topology)
+        if load_topology(settings.topology_file, strict=False).version != source.version:
+            raise ValueError("Topology changed during Foundry parsing; retry with the updated document")
+        atomic_write_json(cache_path, {
+            "source_version": source.version,
+            "source_path": source_path,
+            "markdown": markdown,
+            "model": settings.model.model,
+        })
+    return topology
+
+
+def _resolved_topology(markdown: str, source: Topology) -> Topology:
+    topology = parse_topology(markdown, source_path=source.source_path)
+    topology.version = hashlib.sha256(f"{source.version}:{topology.version}".encode("utf-8")).hexdigest()[:12]
+    topology.parsing_mode = "foundry"
+    topology.issues.append(Issue(
+        "warning", "Topology interpreted by Foundry from free-form text. Review the extracted node and edge types."
+    ))
     return topology

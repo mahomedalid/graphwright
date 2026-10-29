@@ -4,7 +4,10 @@ description: Graph topology for this workspace. Replace the placeholders with yo
 
 # Graph Topology: New Workspace
 
-Describe the business graph you want to build. Discovery stays blocked until at least one node type is defined; the validator lists anything missing or ambiguous.
+Describe the business graph you want to build. With Foundry configured, you can use
+plain text and run `ddg topology` or start an auto/Foundry discovery run to extract
+and validate the graph. Without Foundry, use the structured format below.
+Discovery requires at least one validated node type.
 
 Add other `.md` files alongside this file or in subfolders for background context.
 Their contents are unverified references, not topology definitions or approved facts.

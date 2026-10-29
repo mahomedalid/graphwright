@@ -1,6 +1,60 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from ddg.store import ConflictError, ProposalRejected, atomic_write_json
+
+
+def test_given_partially_written_event_when_reading_then_only_complete_lines_are_returned(store):
+    store.append_event("run-test", {"type": "model_call_started"})
+    path = store.run_dir("run-test") / "events.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"type": "unfinished"')
+
+    events = store.read_events("run-test")
+
+    assert [event["type"] for event in events] == ["model_call_started"]
+    assert store.read_events("run-test", limit=0) == []
+
+
+@pytest.mark.parametrize("damaged", [b"not-json", b'{"type":', b"\xff", b"null", b"[]"])
+def test_given_damaged_event_when_reading_then_valid_events_are_preserved(store, damaged):
+    store.append_event("run-test", {"type": "first"})
+    path = store.run_dir("run-test") / "events.jsonl"
+    with path.open("ab") as handle:
+        handle.write(damaged + b"\n")
+    store.append_event("run-test", {"type": "last"})
+
+    events = store.read_events("run-test", limit=2)
+
+    assert [event["type"] for event in events] == ["first", "last"]
+
+
+def test_given_incomplete_utf8_tail_when_appending_then_new_event_is_readable(store):
+    store.append_event("run-test", {"type": "first"})
+    path = store.run_dir("run-test") / "events.jsonl"
+    with path.open("ab") as handle:
+        handle.write(b'{"type": "\xe2\x82')
+
+    before = store.read_events("run-test")
+    store.append_event("run-test", {"type": "last"})
+    after = store.read_events("run-test")
+
+    assert [event["type"] for event in before] == ["first"]
+    assert [event["type"] for event in after] == ["first", "last"]
+
+
+def test_given_concurrent_writers_when_appending_then_all_events_are_intact(store):
+    def append(index):
+        store.append_event("run-test", {"index": index, "payload": "x" * 10000})
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(append, range(16)))
+
+    events = store.read_events("run-test")
+
+    assert sorted(event["index"] for event in events) == list(range(16))
+    assert all(event["payload"] == "x" * 10000 for event in events)
 
 
 def _candidate(**overrides):

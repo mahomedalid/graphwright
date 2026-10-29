@@ -16,7 +16,7 @@ from .adapters import create_adapter
 from .config import Settings
 from .mappings import BuildSpec, build_spec
 from .store import Store, atomic_write_json, atomic_write_text
-from .topology import load_topology
+from .topology import TopologyError, load_workspace_topology
 
 GRAPH_FORMAT = "ddg-graph/v1"
 
@@ -293,7 +293,10 @@ def render(spec: BuildSpec, source_cfg_options: dict, filename: str, generated_a
 
 def generate(settings: Settings, source: str, allow_stale: bool = False, store: Store | None = None) -> dict:
     store = store or Store(settings)
-    topology = load_topology(settings.topology_file, strict=True)
+    try:
+        topology = load_workspace_topology(settings)
+    except TopologyError as exc:
+        raise CodegenError([str(exc)]) from exc
     source_cfg = settings.source(source)
     adapter = None
     try:

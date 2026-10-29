@@ -197,16 +197,37 @@ class HeuristicPlanner:
                         break
             return best
 
+        def accept(table: str, ref, target: dict) -> tuple[list[str], list[str]] | None:
+            """(extra evidence ids, transform chain) that make `ref` acceptable, or None.
+
+            Exploratory mode accepts low overlap when some transform makes the key formats compatible.
+            """
+            if not ref:
+                return None
+            if ref[2]["row_coverage"] >= MIN_COVERAGE:
+                return [], ref[1]
+            if tools.mode != "exploratory":
+                return None
+            for chain in [ref[1], *[c for c in TRANSFORM_OPTIONS if c != ref[1]]]:
+                compat = tools.check_compatibility(
+                    table, ref[0], target["source_table"], target["key_columns"][0], chain, target["key_transforms"][0]
+                )
+                if compat.get("verdict") == "compatible":
+                    return [compat["evidence_id"]], chain
+            return None
+
         ta, tb = a["source_table"], b["source_table"]
         ref = best_reference(ta, b, b_concepts, set(a["key_columns"]))
-        if ref and ref[2]["row_coverage"] >= MIN_COVERAGE:
+        ok = accept(ta, ref, b)
+        if ok is not None:
             # Each source row is one `from` node; repeated `to` keys mean many-to-one.
             card = ("many" if ref[2]["left_max_rows_per_key"] > 1 else "one") + "-to-one"
-            options.append((ref[2]["row_coverage"], ta, a["key_columns"][0], a["key_transforms"][0], ref[0], ref[1], [ref[2]], card))
+            options.append((ref[2]["row_coverage"], ta, a["key_columns"][0], a["key_transforms"][0], ref[0], ok[1], [ref[2]], card, ok[0]))
         ref = best_reference(tb, a, a_concepts, set(b["key_columns"]))
-        if ref and ref[2]["row_coverage"] >= MIN_COVERAGE:
+        ok = accept(tb, ref, a)
+        if ok is not None:
             card = "one-to-" + ("many" if ref[2]["left_max_rows_per_key"] > 1 else "one")
-            options.append((ref[2]["row_coverage"], tb, ref[0], ref[1], b["key_columns"][0], b["key_transforms"][0], [ref[2]], card))
+            options.append((ref[2]["row_coverage"], tb, ref[0], ok[1], b["key_columns"][0], b["key_transforms"][0], [ref[2]], card, ok[0]))
         if not options:
             edge_concepts = concept_tokens(edge)
             bridges = sorted(
@@ -215,20 +236,23 @@ class HeuristicPlanner:
             )
             for table in bridges[:6]:
                 left = best_reference(table, a, a_concepts, set())
-                if not left or left[2]["row_coverage"] < MIN_COVERAGE:
+                left_ok = accept(table, left, a)
+                if left_ok is None:
                     continue
                 right = best_reference(table, b, b_concepts, {left[0]})
-                if not right or right[2]["row_coverage"] < MIN_COVERAGE:
+                right_ok = accept(table, right, b)
+                if right_ok is None:
                     continue
                 coverage = min(left[2]["row_coverage"], right[2]["row_coverage"])
                 card = ("many" if right[2]["left_max_rows_per_key"] > 1 else "one") + "-to-" + (
                     "many" if left[2]["left_max_rows_per_key"] > 1 else "one"
                 )
-                options.append((coverage, table, left[0], left[1], right[0], right[1], [left[2], right[2]], card))
+                options.append((coverage, table, left[0], left_ok[1], right[0], right_ok[1], [left[2], right[2]], card,
+                                left_ok[0] + right_ok[0]))
                 break
 
         options.sort(key=lambda o: -o[0])
-        for coverage, table, from_col, from_chain, to_col, to_chain, joins, observed in options:
+        for coverage, table, from_col, from_chain, to_col, to_chain, joins, observed, extra_evidence in options:
             properties = _match_properties(edge.properties, tools.inventory[table]["columns"], exclude={from_col, to_col})
             mapping = {
                 "edge_type": edge.name,
@@ -267,9 +291,11 @@ class HeuristicPlanner:
                     f"Value-overlap checks show row coverage {coverage:.0%}; observed {edge.from_type}->{edge.to_type} "
                     f"cardinality '{observed}'; topology cardinality '{edge.cardinality or 'unspecified'}'."
                 ),
-                evidence_ids=[tools.inventory[table]["evidence_id"], *[j["evidence_id"] for j in joins]],
+                evidence_ids=[tools.inventory[table]["evidence_id"], *[j["evidence_id"] for j in joins], *extra_evidence],
                 mapping=mapping,
-                limitations=limitations,
+                limitations=limitations + (
+                    ["Low value overlap; supported mainly by column naming and compatible key formats."] if extra_evidence else []
+                ),
                 confidence=round(min(0.9, 0.5 + 0.4 * coverage), 2),
             )
             if "candidate_id" in result:

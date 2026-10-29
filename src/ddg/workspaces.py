@@ -16,7 +16,7 @@ from .config import (
     workspaces_dir,
 )
 from .context import markdown_files
-from .topology import load_topology
+from .topology import load_workspace_topology
 
 # Only configuration is copied; runtime artifacts (runs, candidates, facts, ...) never are.
 COPY_FILES = (WORKSPACE_FILENAME, "topology.md")
@@ -62,7 +62,7 @@ def _set_description(path: Path, description: str) -> None:
 
 def describe_workspace(root: Path, name: str) -> dict:
     settings = load_settings(root, name)
-    topology = load_topology(settings.topology_file, strict=False)
+    topology = load_workspace_topology(settings, strict=False)
 
     def count(directory: Path, pattern: str) -> int:
         return sum(1 for _ in directory.glob(pattern)) if directory.exists() else 0
@@ -74,6 +74,7 @@ def describe_workspace(root: Path, name: str) -> dict:
         "active": name == active_workspace(root),
         "sources": [{"name": s.name, "type": s.type} for s in settings.sources.values()],
         "topology": {"title": topology.title, "version": topology.version, "is_valid": topology.is_valid,
+                     "parsing_mode": topology.parsing_mode,
                      "errors": len(topology.errors)},
         "counts": {
             "candidates_pending": sum(

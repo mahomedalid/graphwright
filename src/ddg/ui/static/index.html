@@ -21,6 +21,7 @@
         <li><button role="tab" data-tab="runs" aria-selected="true">Runs</button></li>
         <li><button role="tab" data-tab="review" aria-selected="false">Review <span id="pending-badge" class="badge" aria-label="pending candidates"></span></button></li>
         <li><button role="tab" data-tab="facts" aria-selected="false">Facts &amp; Code</button></li>
+        <li><button role="tab" data-tab="dictionary" aria-selected="false">Dictionary</button></li>
         <li><button role="tab" data-tab="graph" aria-selected="false">Graph</button></li>
         <li><button role="tab" data-tab="topology" aria-selected="false">Topology &amp; Metadata</button></li>
       </ul>
@@ -44,6 +45,29 @@
     </form>
   </dialog>
 
+  <dialog id="reset-dialog" aria-labelledby="reset-title">
+    <form id="reset-form">
+      <h2 id="reset-title">Reset discovery</h2>
+      <p class="small">Archives the selected items to <code>archive/</code> in this workspace so the next run starts fresh. Nothing is deleted.
+        Topology, context documents, dictionary annotations, and configuration are never touched.</p>
+      <fieldset class="reset-scopes">
+        <legend>Archive</legend>
+        <label class="inline"><input type="checkbox" name="scope" value="runs" checked> Run history and evidence <span class="muted small" data-count="runs"></span></label>
+        <label class="inline"><input type="checkbox" name="scope" value="pending" checked> Pending candidates <span class="muted small" data-count="pending"></span></label>
+        <label class="inline"><input type="checkbox" name="scope" value="metadata" checked> Source inventories and cached topology parse <span class="muted small" data-count="metadata"></span></label>
+        <label class="inline"><input type="checkbox" name="scope" value="rejected"> Rejected candidates (the agent may propose them again) <span class="muted small" data-count="rejected"></span></label>
+        <label class="inline"><input type="checkbox" name="scope" value="approved"> Approved candidates and facts (requires re-approval) <span class="muted small" data-count="approved"></span></label>
+      </fieldset>
+      <p class="muted small">Archiving runs also clears column profiles shown in the Dictionary.</p>
+      <label>Type the workspace name to confirm <input name="confirm" id="reset-confirm" autocomplete="off" required></label>
+      <p id="reset-error" class="error" role="alert"></p>
+      <div class="row">
+        <button type="submit" class="primary">Archive and reset</button>
+        <button type="button" id="reset-cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
   <div id="toast" role="status" aria-live="polite" class="toast hidden"></div>
 
   <main>
@@ -62,15 +86,24 @@
               <option value="">Default (auto)</option>
               <option value="foundry">Foundry agent</option>
               <option value="heuristic">Offline heuristic</option>
+              <option value="profile">Profile columns only (data dictionary)</option>
+            </select>
+          </label>
+          <label>Mode
+            <select name="mode" id="run-mode">
+              <option value="">Workspace default</option>
+              <option value="conservative">Conservative: only medium/high confidence</option>
+              <option value="exploratory">Exploratory: also propose low-confidence hypotheses</option>
             </select>
           </label>
           <div class="row">
             <label>Max minutes <input name="max_minutes" type="number" min="0.1" step="0.1"></label>
-            <label>Max iterations <input name="max_iterations" type="number" min="1"></label>
+            <label>Max iterations <input name="max_iterations" type="number" min="1" max="99" step="1" placeholder="3"></label>
             <label>Max cost (USD) <input name="max_cost_usd" type="number" min="0" step="0.1"></label>
           </div>
           <p class="muted small">Blank limits use the workspace defaults (workspace.toml, then ddg.toml). The run continues autonomously until a limit, a stall, or cancellation.</p>
           <button type="submit" class="primary">Start run</button>
+          <button type="button" id="reset-btn" title="Archive runs, candidates, or inventories so discovery starts fresh">Reset discovery…</button>
         </form>
         <div class="card">
           <h2>Runs</h2>
@@ -97,6 +130,14 @@
           </select>
         </label>
         <label>Reviewer <input id="reviewer" placeholder="Your name" autocomplete="name"></label>
+        <label>Confidence
+          <select id="review-tier">
+            <option value="">All tiers</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+          </select>
+        </label>
         <button id="review-refresh">Refresh</button>
       </div>
       <div class="grid review">
@@ -153,6 +194,30 @@
         <summary>Text view of the displayed graph</summary>
         <div id="graph-text"></div>
       </details>
+    </section>
+
+    <!-- Dictionary -->
+    <section id="tab-dictionary" role="tabpanel" class="tab hidden">
+      <div class="toolbar">
+        <label>Source <select id="dict-source"></select></label>
+        <label>Filter <input id="dict-filter" type="search" placeholder="table or column name"></label>
+        <label>Show
+          <select id="dict-show">
+            <option value="">All tables</option>
+            <option value="mapped">Mapped to the graph</option>
+            <option value="undescribed">Missing descriptions</option>
+            <option value="suggestions">Pending suggestions</option>
+          </select>
+        </label>
+        <label>Editor <input id="dict-author" placeholder="Your name" autocomplete="name"></label>
+        <button id="dict-profile-btn" type="button" title="Collect null rates, distinct counts, and value shapes for columns not yet profiled">Profile columns</button>
+        <button id="dict-export-btn" type="button">Export Markdown</button>
+      </div>
+      <p id="dict-summary" class="muted small" aria-live="polite"></p>
+      <div class="grid review">
+        <div class="card list" id="dict-tables" aria-label="Tables"></div>
+        <div class="card" id="dict-detail"><p class="muted">Select a table to see what we know about it.</p></div>
+      </div>
     </section>
 
     <!-- Topology -->

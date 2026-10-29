@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, AsyncIterator, Callable
 
 from .config import ModelSettings, RunLimits
+
+logger = logging.getLogger(__name__)
 
 
 class StopRun(Exception):
@@ -35,6 +40,36 @@ class RunControl:
     cancel_requested: Callable[[], bool]
     usage: Usage = field(default_factory=Usage)
     started: float = field(default_factory=time.monotonic)
+    on_event: Callable[[dict], None] | None = None
+
+    def emit(self, event_type: str, **details: Any) -> None:
+        """Record operational metadata without prompts, responses, or row values."""
+        event = {"type": event_type, "elapsed_seconds": round(self.elapsed_seconds, 2), **details}
+        logger.info("Discovery progress: %s", event)
+        if self.on_event:
+            self.on_event(event)
+
+    @asynccontextmanager
+    async def model_call(self, phase: str) -> AsyncIterator[None]:
+        """Log a model request and bound the wait by the remaining run time."""
+        self.before_model_call()
+        call = self.usage.model_calls
+        started = time.monotonic()
+        self.emit("model_call_started", phase=phase, model_call=call, remaining_seconds=round(self.remaining_seconds(), 2))
+        try:
+            async with asyncio.timeout(self.remaining_seconds()):
+                yield
+        except TimeoutError as exc:
+            self.emit("model_call_failed", phase=phase, model_call=call, reason="time_limit",
+                      duration_seconds=round(time.monotonic() - started, 2))
+            raise StopRun("time_limit") from exc
+        except Exception as exc:
+            self.emit("model_call_failed", phase=phase, model_call=call, error_type=type(exc).__name__,
+                      duration_seconds=round(time.monotonic() - started, 2))
+            raise
+        else:
+            self.emit("model_call_completed", phase=phase, model_call=call,
+                      duration_seconds=round(time.monotonic() - started, 2), usage=self.usage.to_dict())
 
     @property
     def elapsed_seconds(self) -> float:

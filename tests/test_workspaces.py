@@ -52,7 +52,7 @@ def test_copy_from_existing_workspace_copies_config_not_artifacts(project, setti
 
 def test_workspaces_are_isolated(project, settings, store):
     runner = DiscoveryRunner(settings, store)
-    runner.execute(runner.create_run("retail", "heuristic")["id"])
+    runner.execute(runner.create_run("retail", "heuristic", {"max_iterations": 20})["id"])
     assert len(store.list_candidates()) == 7
 
     create_workspace(project, "retail-b", source="retail")
@@ -79,7 +79,7 @@ def test_workspace_overrides_global_defaults(project):
     with (path / "workspace.toml").open("a", encoding="utf-8") as handle:
         handle.write("\n[run]\nmax_minutes = 1.5\n\n[agent]\nplanner = \"heuristic\"\n")
     settings = load_settings(project, "tight")
-    assert settings.limits.max_minutes == 1.5 and settings.limits.max_iterations == 20
+    assert settings.limits.max_minutes == 1.5 and settings.limits.max_iterations == 3
     assert settings.planner == "heuristic"
 
 
@@ -135,7 +135,7 @@ def test_api_picks_up_workspace_config_changes(project):
 
 def test_describe_workspace_counts(project, settings, store):
     runner = DiscoveryRunner(settings, store)
-    runner.execute(runner.create_run("retail", "heuristic")["id"])
+    runner.execute(runner.create_run("retail", "heuristic", {"max_iterations": 20})["id"])
     info = describe_workspace(project, "retail")
     assert info["counts"]["candidates_pending"] == 7 and info["counts"]["runs"] == 1
     assert json.dumps(info)

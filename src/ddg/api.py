@@ -14,7 +14,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -22,6 +22,9 @@ from . import __version__
 from .adapters import create_adapter
 from .agent.runner import ACTIVE_STATES, DiscoveryRunner
 from .codegen import CodegenError, generate, list_generated
+from .confidence import ensure_confidence
+from .narrative import candidate_label, facts_story, fallback_story, run_story
+from .dictionary import DictionaryError, DictionaryStore, build_dictionary, to_markdown
 from .config import (
     CONFIG_FILENAME,
     TEMPLATE_NAME,
@@ -39,7 +42,7 @@ from .config import (
 from .graph import GraphFormatError, GraphRepository
 from .mappings import revalidation_issues
 from .store import ConflictError, Store, read_json
-from .topology import load_topology
+from .topology import load_workspace_topology
 from .workspaces import create_workspace, describe_all, describe_workspace
 
 STATIC_DIR = Path(__file__).parent / "ui" / "static"
@@ -48,12 +51,20 @@ STATIC_DIR = Path(__file__).parent / "ui" / "static"
 class RunRequest(BaseModel):
     source: str
     planner: str | None = None
+    mode: str | None = Field(default=None, pattern="^(conservative|exploratory)$")
     limits: dict[str, Any] = Field(default_factory=dict)
 
 
 class ResumeRequest(BaseModel):
     planner: str | None = None
+    mode: str | None = Field(default=None, pattern="^(conservative|exploratory)$")
     limits: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResetRequest(BaseModel):
+    scopes: list[str] = Field(min_length=1)
+    actor: str = Field(min_length=1, max_length=200)
+    confirm: str = Field(description="Must equal the workspace name")
 
 
 class DecisionRequest(BaseModel):
@@ -73,6 +84,15 @@ class WorkspaceRequest(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     description: str = Field(default="", max_length=500)
     copy_from: str = TEMPLATE_NAME
+
+
+class DictionaryEdit(BaseModel):
+    author: str = Field(min_length=1, max_length=200)
+    expected_revision: int
+    description: str | None = Field(default=None, max_length=5000)
+    notes: str | None = Field(default=None, max_length=5000)
+    status: str | None = Field(default=None, pattern="^(provisional|verified|deprecated)$")
+    values: dict[str, str] | None = None
 
 
 @dataclass
@@ -190,6 +210,7 @@ def create_app(root: Path | None = None) -> FastAPI:
             "path": str(s.workspace_dir),
             "foundry_configured": s.model.configured,
             "default_planner": s.planner,
+            "default_mode": s.mode,
             "sources": [{"name": src.name, "type": src.type} for src in s.sources.values()],
             "limits": s.limits.__dict__,
             "sampling": {"max_rows": s.sampling.max_rows, "allowlist": s.sampling.allowlist},
@@ -197,7 +218,7 @@ def create_app(root: Path | None = None) -> FastAPI:
 
     @ws.get("/topology")
     def topology(ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
-        return load_topology(ctx.settings.topology_file, strict=False).to_dict()
+        return load_workspace_topology(ctx.settings, strict=False).to_dict()
 
     @ws.get("/metadata/{source}")
     def metadata(source: str, ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
@@ -214,7 +235,7 @@ def create_app(root: Path | None = None) -> FastAPI:
         if body.source not in ctx.settings.sources:
             raise HTTPException(400, f"Unknown source '{body.source}' in workspace '{ctx.settings.workspace}'")
         try:
-            run = ctx.runner.create_run(body.source, body.planner, body.limits)
+            run = ctx.runner.create_run(body.source, body.planner, body.limits, mode=body.mode)
         except (ValueError, KeyError) as exc:
             raise HTTPException(400, str(exc)) from exc
         start_thread(ctx, run["id"])
@@ -222,7 +243,7 @@ def create_app(root: Path | None = None) -> FastAPI:
 
     @ws.get("/runs/{run_id}")
     def get_run(run_id: str, events: int = Query(200, ge=0, le=2000), ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
-        run = _get_run(ctx.store, run_id)
+        run = _with_stories(ctx.store, _get_run(ctx.store, run_id))
         return {**run, "events": ctx.store.read_events(run_id, events)}
 
     @ws.post("/runs/{run_id}/cancel")
@@ -237,17 +258,30 @@ def create_app(root: Path | None = None) -> FastAPI:
     def resume_run(run_id: str, body: ResumeRequest, ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
         previous = _get_run(ctx.store, run_id)
         try:
-            run = ctx.runner.create_run(previous["source"], body.planner or previous.get("planner"), body.limits, resume_from=run_id)
+            run = ctx.runner.create_run(previous["source"], body.planner or previous.get("planner"), body.limits,
+                                        resume_from=run_id, mode=body.mode or previous.get("mode"))
         except (ValueError, KeyError) as exc:
             raise HTTPException(409, str(exc)) from exc
         start_thread(ctx, run["id"])
         return run
 
+    def _with_tier(ctx: WorkspaceContext, candidate: dict, topo=None) -> dict:
+        if candidate.get("confidence_tier"):
+            return candidate
+        topo = topo or load_workspace_topology(ctx.settings, strict=False)
+        edge = topo.edge_types.get((candidate.get("mapping") or {}).get("edge_type", ""))
+        return ensure_confidence(candidate, edge.cardinality if edge else None)
+
     @ws.get("/candidates")
-    def candidates(status: str | None = None, source: str | None = None, ctx: WorkspaceContext = Depends(workspace_ctx)) -> list[dict]:
-        items = ctx.store.list_candidates(status)
+    def candidates(status: str | None = None, source: str | None = None, tier: str | None = None,
+                   ctx: WorkspaceContext = Depends(workspace_ctx)) -> list[dict]:
+        raw = ctx.store.list_candidates(status)
+        topo = load_workspace_topology(ctx.settings, strict=False) if any(not c.get("confidence_tier") for c in raw) else None
+        items = [_with_tier(ctx, c, topo) for c in raw]
         if source:
             items = [c for c in items if c.get("scope", {}).get("source") == source]
+        if tier:
+            items = [c for c in items if c.get("confidence_tier") == tier]
         return items
 
     @ws.get("/candidates/{candidate_id}")
@@ -256,7 +290,23 @@ def create_app(root: Path | None = None) -> FastAPI:
             item = ctx.store.get_candidate(candidate_id)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        return item or _not_found(candidate_id)
+        return _with_tier(ctx, item) if item else _not_found(candidate_id)
+
+    @ws.get("/reset")
+    def reset_preview(ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
+        return {"counts": ctx.store.reset_preview(), "scopes": list(Store.RESET_SCOPES)}
+
+    @ws.post("/reset")
+    def reset(body: ResetRequest, ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
+        if body.confirm != ctx.settings.workspace:
+            raise HTTPException(400, "Type the workspace name to confirm the reset")
+        live = [rid for rid, t in threads.items() if t.is_alive()]
+        try:
+            return ctx.store.reset(body.scopes, body.actor, active_run_ids=[r for r in live if ctx.store.get_run(r)])
+        except ConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @ws.post("/candidates/{candidate_id}/decision")
     def decide(candidate_id: str, body: DecisionRequest, ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
@@ -278,7 +328,7 @@ def create_app(root: Path | None = None) -> FastAPI:
         s = ctx.settings
         if source not in s.sources:
             raise HTTPException(400, f"Unknown source '{source}'")
-        topo = load_topology(s.topology_file, strict=False)
+        topo = load_workspace_topology(s, strict=False)
         adapter = None
         try:
             adapter = create_adapter(s, s.source(source))
@@ -303,6 +353,50 @@ def create_app(root: Path | None = None) -> FastAPI:
     @ws.get("/codegen")
     def generated(ctx: WorkspaceContext = Depends(workspace_ctx)) -> list[dict]:
         return list_generated(ctx.settings)
+
+    # ---- data dictionary ------------------------------------------------------------
+    def _dictionary_source(ctx: WorkspaceContext, source: str) -> None:
+        if source not in ctx.settings.sources:
+            raise HTTPException(404, f"Unknown source '{source}'")
+
+    @ws.get("/dictionary/{source}")
+    def dictionary(source: str, ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
+        _dictionary_source(ctx, source)
+        return build_dictionary(ctx.settings, ctx.store, source)
+
+    @ws.get("/dictionary/{source}/markdown")
+    def dictionary_markdown(source: str, ctx: WorkspaceContext = Depends(workspace_ctx)) -> PlainTextResponse:
+        _dictionary_source(ctx, source)
+        text = to_markdown(build_dictionary(ctx.settings, ctx.store, source))
+        filename = f"{ctx.settings.workspace}-{source}-dictionary.md"
+        return PlainTextResponse(text, media_type="text/markdown; charset=utf-8",
+                                 headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    def _edit_dictionary(ctx: WorkspaceContext, source: str, table: str, column: str | None, body: "DictionaryEdit") -> dict:
+        _dictionary_source(ctx, source)
+        known = {t["name"]: t for t in build_dictionary(ctx.settings, ctx.store, source)["tables"]}
+        if table not in known:
+            raise HTTPException(404, f"Unknown table '{table}' in source '{source}'. Run discovery or profiling first.")
+        if column is not None and column not in {c["name"] for c in known[table]["columns"]}:
+            raise HTTPException(404, f"Unknown column '{column}' in table '{table}'")
+        changes = body.model_dump(exclude_unset=True, exclude={"author", "expected_revision"})
+        if column is None and "values" in changes:
+            raise HTTPException(400, "values (code meanings) apply to columns only")
+        try:
+            return DictionaryStore(ctx.settings).update(source, table, column, changes, body.author, body.expected_revision)
+        except ConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except DictionaryError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @ws.put("/dictionary/{source}/tables/{table}")
+    def edit_table(source: str, table: str, body: DictionaryEdit, ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
+        return _edit_dictionary(ctx, source, table, None, body)
+
+    @ws.put("/dictionary/{source}/tables/{table}/columns/{column}")
+    def edit_column(source: str, table: str, column: str, body: DictionaryEdit,
+                    ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
+        return _edit_dictionary(ctx, source, table, column, body)
 
     def _graph(ctx: WorkspaceContext, name: str):
         try:
@@ -356,6 +450,27 @@ def create_app(root: Path | None = None) -> FastAPI:
     return app
 
 
+def _with_stories(store: Store, run: dict) -> dict:
+    """Backfill human stories for runs recorded before stories existed (display only; not persisted)."""
+    iterations = []
+    for it in run.get("iterations", []):
+        if not it.get("activity"):
+            proposed = []
+            for cid in it.get("new_candidates", []):
+                c = store.get_candidate(cid)
+                if c:
+                    c = ensure_confidence(c)
+                    proposed.append({"id": cid, "label": candidate_label(c), "tier": c.get("confidence_tier")})
+            it = {**it, "activity": {"proposed": proposed}}
+        if not it.get("story"):
+            it = {**it, "story": fallback_story(it.get("summary") or "") or facts_story(it["activity"])}
+        iterations.append(it)
+    run = {**run, "iterations": iterations}
+    if not run.get("story") or run.get("status") in ("queued", "running", "stopping"):
+        run["story"] = run_story(run)
+    return run
+
+
 def _asset_version() -> str:
     digest = hashlib.sha256()
     for name in ("app.js", "style.css"):
@@ -378,5 +493,5 @@ def _get_run(store: Store, run_id: str) -> dict:
 def _run_brief(run: dict) -> dict:
     return {
         k: run.get(k)
-        for k in ("id", "created_at", "status", "source", "planner", "resumed_from", "termination_reason", "error", "usage", "ended_at", "elapsed_seconds", "topology_version")
+        for k in ("id", "created_at", "status", "source", "planner", "mode", "resumed_from", "termination_reason", "error", "usage", "ended_at", "elapsed_seconds", "topology_version")
     } | {"iterations": len(run.get("iterations", [])), "candidates": sum(len(i.get("new_candidates", [])) for i in run.get("iterations", []))}

@@ -13,7 +13,7 @@ planner = "auto"
 
 [run]
 max_minutes = 10
-max_iterations = 20
+max_iterations = 3
 max_model_calls = 60
 max_tool_calls = 400
 max_cost_usd = 2.0

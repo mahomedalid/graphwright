@@ -33,7 +33,8 @@ def cmd_workspace(args) -> int:
         for ws in describe_all(root):
             marker = "*" if ws["active"] else " "
             n = ws["topology"]["errors"]
-            topo = "valid" if ws["topology"]["is_valid"] else f"invalid ({n} error{'' if n == 1 else 's'})"
+            topo = ("awaiting Foundry parsing" if ws["topology"]["parsing_mode"] == "pending_foundry"
+                    else "valid" if ws["topology"]["is_valid"] else f"invalid ({n} error{'' if n == 1 else 's'})")
             c = ws["counts"]
             print(f"{marker} {ws['name']:<20} sources={len(ws['sources'])} topology={topo} "
                   f"pending={c['candidates_pending']} facts={c['facts']} runs={c['runs']}  {ws['description']}")
@@ -95,13 +96,36 @@ def cmd_sources(args) -> int:
     return 1 if failures else 0
 
 
+def cmd_dictionary(args) -> int:
+    from .dictionary import export
+    from .store import Store
+
+    settings = _settings(args)
+    names = [args.source] if args.source else list(settings.sources)
+    if not names:
+        print(f"Workspace '{settings.workspace}' has no sources.", file=sys.stderr)
+        return 1
+    store = Store(settings)
+    for name in names:
+        settings.source(name)
+        paths = export(settings, store, name)
+        print(f"[{name}] {paths['markdown']}")
+        print(f"[{name}] {paths['json']}")
+    return 0
+
+
 def cmd_topology(args) -> int:
     import json
 
-    from .topology import load_topology
+    from .control import StopRun
+    from .topology import TopologyError, load_workspace_topology
 
     settings = _settings(args)
-    topology = load_topology(settings.topology_file, strict=False)
+    try:
+        topology = load_workspace_topology(settings, strict=False, resolve=True)
+    except (TopologyError, StopRun) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     if args.json:
         print(json.dumps(topology.to_dict(), indent=2))
     else:
@@ -137,7 +161,9 @@ def cmd_run(args) -> int:
             print(f"Specify --source; workspace '{settings.workspace}' has sources {sorted(settings.sources)}", file=sys.stderr)
             return 2
         source = next(iter(settings.sources))
-    run = runner.create_run(source, args.planner, _limits(args), resume_from=getattr(args, "run_id", None))
+    run = runner.create_run(source, args.planner, _limits(args), resume_from=getattr(args, "run_id", None),
+                            mode=args.mode)
+    print(f"Mode: {run['mode']}")
     print(f"Started {run['id']} in workspace '{settings.workspace}' on source '{run['source']}'")
     result = runner.execute(run["id"])
     for item in result["iterations"]:
@@ -157,6 +183,7 @@ def cmd_resume(args) -> int:
         return 1
     args.source = previous["source"]
     args.planner = args.planner or previous.get("planner")
+    args.mode = args.mode or previous.get("mode")
     return cmd_run(args)
 
 
@@ -177,10 +204,39 @@ def cmd_runs(args) -> int:
 
 
 def cmd_candidates(args) -> int:
+    from .confidence import ensure_confidence
     from .store import Store
 
     for c in Store(_settings(args)).list_candidates(args.status):
-        print(f"{c['id']}  v{c['version']} {c['status']:<9} {c['kind']:<13} {c['hypothesis']}")
+        c = ensure_confidence(c)
+        if args.tier and c["confidence_tier"] != args.tier:
+            continue
+        print(f"{c['id']}  v{c['version']} {c['status']:<9} {c['confidence_tier']:<6} {c['kind']:<13} {c['hypothesis']}")
+    return 0
+
+
+def cmd_reset(args) -> int:
+    from .store import Store
+
+    settings = _settings(args)
+    store = Store(settings)
+    scopes = ["runs", "pending", "metadata"] if args.fresh else [s for s in Store.RESET_SCOPES if getattr(args, s)]
+    if not scopes:
+        print("Choose what to reset: --fresh, or any of --runs --pending --rejected --approved --metadata", file=sys.stderr)
+        return 2
+    counts = store.reset_preview()
+    print(f"Workspace '{settings.workspace}': will archive " + ", ".join(f"{s} ({counts[s]})" for s in scopes))
+    if "approved" in scopes:
+        print("WARNING: approved facts will be archived; generated builders will need re-approval.")
+    if "rejected" in scopes:
+        print("Note: archiving rejected candidates lets the agent propose those interpretations again.")
+    if not args.yes:
+        answer = input(f"Type the workspace name ({settings.workspace}) to confirm: ").strip()
+        if answer != settings.workspace:
+            print("Cancelled.")
+            return 1
+    manifest = store.reset(scopes, args.actor or "cli")
+    print(f"Archived {manifest['moved'] or 'nothing'} to {manifest['path']}")
     return 0
 
 
@@ -254,6 +310,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("action", choices=["check"])
     p.add_argument("--source", help="Check only this source")
 
+    p = add("dictionary", cmd_dictionary, "Export the data dictionary (Markdown + JSON) for each source")
+    p.add_argument("--source", help="Export only this source")
+
     p = add("topology", cmd_topology, "Validate and print the workspace topology")
     p.add_argument("--json", action="store_true")
 
@@ -263,7 +322,10 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--source", help="Source name (optional when the workspace has one source)")
         else:
             p.add_argument("run_id")
-        p.add_argument("--planner", choices=["auto", "foundry", "heuristic"])
+        p.add_argument("--planner", choices=["auto", "foundry", "heuristic", "profile"],
+                       help="profile = only collect column statistics for the data dictionary")
+        p.add_argument("--mode", choices=["conservative", "exploratory"],
+                       help="exploratory also accepts low-confidence proposals (default from workspace [agent] mode)")
         p.add_argument("--max-minutes", type=float)
         p.add_argument("--max-iterations", type=int)
         p.add_argument("--max-cost-usd", type=float)
@@ -271,8 +333,20 @@ def main(argv: list[str] | None = None) -> int:
     add("cancel", cmd_cancel, "Request cancellation of an active run").add_argument("run_id")
     add("runs", cmd_runs, "List runs")
 
-    p = add("candidates", cmd_candidates, "List candidates")
+    p = add("candidates", cmd_candidates, "List candidates with their confidence tier")
     p.add_argument("--status", choices=["pending", "approved", "rejected"])
+    p.add_argument("--tier", choices=["high", "medium", "low"])
+
+    p = add("reset", cmd_reset, "Archive discovery state so the next run starts fresh (nothing is deleted)")
+    p.add_argument("--fresh", action="store_true", help="Same as --runs --pending --metadata (keeps approved and rejected)")
+    for scope, text in (("runs", "run history, checkpoints, evidence (also clears dictionary column profiles)"),
+                        ("pending", "pending candidates"),
+                        ("rejected", "rejected candidates (lifts their resubmission block)"),
+                        ("approved", "approved candidates and their facts"),
+                        ("metadata", "source inventories and cached topology parse")):
+        p.add_argument(f"--{scope}", action="store_true", help=text)
+    p.add_argument("--actor", help="Name recorded in the archive manifest")
+    p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
     p = add("review", cmd_review, "Approve or reject a candidate")
     p.add_argument("candidate_id")
@@ -292,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args) or 0)
-    except WorkspaceError as exc:
+    except (WorkspaceError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

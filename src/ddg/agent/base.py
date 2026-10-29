@@ -24,6 +24,7 @@ class IterationResult:
     summary: str
     memory: dict
     done: bool = False
+    story: str | None = None  # short plain-language narrative for humans; summary keeps the full detail
 
 
 class Planner(Protocol):

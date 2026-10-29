@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import copy
 import time
 import traceback
 from typing import Any
 
 from ..adapters import create_adapter
-from ..config import Settings
+from ..config import MODES, Settings
 from ..context import load_context_documents
 from ..control import RunControl, StopRun
+from ..narrative import facts_story, iteration_activity, run_story
 from ..store import Store, atomic_write_json, new_id, utcnow
 from ..tools import DiscoveryTools
-from ..topology import TopologyError, load_topology
+from ..topology import TopologyError, load_workspace_topology
 from .base import IterationContext, Planner
 from .heuristic import HeuristicPlanner
 
@@ -26,11 +28,15 @@ def choose_planner(settings: Settings, requested: str | None, control: RunContro
         name = "foundry" if settings.model.configured else "heuristic"
     if name == "heuristic":
         return HeuristicPlanner()
+    if name == "profile":
+        from .profile_planner import ProfilePlanner
+
+        return ProfilePlanner()
     if name == "foundry":
         from .foundry_planner import FoundryPlanner
 
         return FoundryPlanner(settings, control)
-    raise ValueError(f"Unknown planner '{name}' (expected auto, foundry, or heuristic)")
+    raise ValueError(f"Unknown planner '{name}' (expected auto, foundry, heuristic, or profile)")
 
 
 class DiscoveryRunner:
@@ -44,8 +50,12 @@ class DiscoveryRunner:
         planner: str | None = None,
         limits: dict[str, Any] | None = None,
         resume_from: str | None = None,
+        mode: str | None = None,
     ) -> dict:
         self.settings.source(source)
+        mode = (mode or self.settings.mode).lower()
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {', '.join(MODES)}")
         if resume_from:
             previous = self.store.get_run(resume_from)
             if previous is None:
@@ -63,6 +73,7 @@ class DiscoveryRunner:
             "status": "queued",
             "source": source,
             "planner": planner or self.settings.planner,
+            "mode": mode,
             "limits": merged.__dict__,
             "resumed_from": resume_from,
             "iterations": [],
@@ -79,30 +90,55 @@ class DiscoveryRunner:
         if run is None:
             raise KeyError(run_id)
         limits = self.settings.limits.merged(run["limits"])
-        control = RunControl(limits, self.settings.model, cancel_requested=lambda: self.store.cancel_requested(run_id))
+        control = RunControl(
+            limits, self.settings.model, cancel_requested=lambda: self.store.cancel_requested(run_id),
+            on_event=lambda event: self.store.append_event(run_id, event),
+        )
         adapter = None
         checkpoint: dict = {"memory": {}, "evidence_index": {}, "iteration": 0}
         try:
-            topology = load_topology(self.settings.topology_file, strict=True)
+            previous = (self.store.load_checkpoint(run["resumed_from"]) or {}) if run.get("resumed_from") else {}
+            checkpoint.update({k: previous.get(k, checkpoint[k]) for k in checkpoint})
+            self.store.save_checkpoint(run_id, {
+                **checkpoint, "run_id": run_id, "saved_at": utcnow(),
+                "topology_version": previous.get("topology_version"),
+            })
+            run.update({"status": "running", "started_at": utcnow()})
+            self.store.save_run(run)
+            control.emit("run_started", planner=run["planner"], source=run["source"])
+            control.check()
+            requested_planner = (run.get("planner") or "auto").lower()
+            # Profiling only collects column statistics, so it needs no topology (and never asks Foundry to parse one).
+            profile_only = requested_planner == "profile"
+            control.emit("topology_loading", message="Loading topology; free-form input may require a Foundry request.")
+            topology = load_workspace_topology(
+                self.settings, strict=not profile_only,
+                resolve=requested_planner not in ("heuristic", "profile"), control=control,
+            )
+            control.emit("topology_loaded", parsing_mode=topology.parsing_mode, topology_version=topology.version,
+                         node_types=len(topology.node_types), edge_types=len(topology.edge_types))
+            control.emit("context_loading")
             context_documents = load_context_documents(self.settings.workspace_dir, self.settings.topology_file)
+            control.emit("context_loaded", file_count=len(context_documents))
             run["context_files"] = [document["path"] for document in context_documents]
             run["topology_version"] = topology.version
             self.store.reconcile()
             source_cfg = self.settings.source(run["source"])
+            control.emit("source_connecting", source=source_cfg.name, source_type=source_cfg.type)
             adapter = create_adapter(self.settings, source_cfg)
+            control.emit("source_connected", source=source_cfg.name, dialect=adapter.dialect)
             if run.get("resumed_from"):
-                previous = self.store.load_checkpoint(run["resumed_from"]) or {}
-                checkpoint.update({k: previous.get(k, checkpoint[k]) for k in checkpoint})
                 if previous.get("topology_version") and previous["topology_version"] != topology.version:
                     self.store.append_event(run_id, {"type": "warning", "message": "Topology changed since checkpoint; earlier notes may be stale"})
             planner = choose_planner(self.settings, run.get("planner"), control)
             run["planner"] = planner.name
             tools = DiscoveryTools(
-                self.settings, self.store, adapter, topology, control, run_id, checkpoint["evidence_index"]
+                self.settings, self.store, adapter, topology, control, run_id, checkpoint["evidence_index"],
+                mode=run.get("mode") or self.settings.mode,
+                independent_samples=bool(source_cfg.options.get("independent_samples", False)),
             )
-            run.update({"status": "running", "started_at": utcnow()})
             self.store.save_run(run)
-            self.store.append_event(run_id, {"type": "run_started", "planner": planner.name, "topology_version": topology.version})
+            control.emit("planner_selected", planner=planner.name)
 
             memory = checkpoint["memory"]
             iteration = int(checkpoint["iteration"])
@@ -118,30 +154,43 @@ class DiscoveryRunner:
                 evidence_before = len(tools.evidence_index)
                 started = time.monotonic()
                 self.store.append_event(run_id, {"type": "iteration_started", "iteration": iteration, "review_snapshot_version": snapshot["version"]})
+                memory_before = copy.deepcopy({k: v for k, v in memory.items() if k != "agent_notes"})
                 ctx = IterationContext(iteration, run["source"], topology, snapshot, memory, context_documents)
                 try:
                     result = planner.run_iteration(ctx, tools)
                 finally:
                     new_ids = [c["id"] for c in tools.proposed[proposed_before:]]
+                    refusals = list(tools.proposal_errors)
                     record = {
                         "iteration": iteration,
                         "review_snapshot_version": snapshot["version"],
                         "new_candidates": new_ids,
-                        "proposal_errors": tools.proposal_errors[-5:],
+                        "proposal_errors": refusals[-5:],
+                        "activity": iteration_activity(
+                            [e for e in tools.evidence_index.values() if e.get("run_id") == run_id and e.get("iteration") == iteration],
+                            tools.proposed[proposed_before:], refusals,
+                        ),
                         "duration_seconds": round(time.monotonic() - started, 2),
                         "usage": control.usage.to_dict(),
                     }
+                    record["story"] = facts_story(record["activity"])
                     tools.proposal_errors.clear()
                     run["iterations"].append(record)
                     run["usage"] = control.usage.to_dict()
                     self._checkpoint(run, topology.version, memory, tools, iteration)
                 memory = result.memory
                 record["summary"] = result.summary
+                # The model's own story (if any) explains why; the facts story guarantees what happened is accurate.
+                if result.story:
+                    record["story"] = result.story
+                    record["facts"] = facts_story(record["activity"])
                 self._checkpoint(run, topology.version, memory, tools, iteration)
-                self.store.append_event(run_id, {"type": "iteration_completed", "iteration": iteration, "summary": result.summary[:500], "new_candidates": new_ids})
+                self.store.append_event(run_id, {"type": "iteration_completed", "iteration": iteration, "summary": record["story"][:500], "new_candidates": new_ids})
 
-                # Stalled = no new candidates and no new evidence (PRD section 12).
-                progressed = bool(new_ids) or len(tools.evidence_index) > evidence_before
+                # Stalled = no new candidates, no new evidence, and no planner decisions (for example ruling out a
+                # topology element). Free-text agent notes alone do not count as progress (PRD section 12).
+                memory_after = {k: v for k, v in memory.items() if k != "agent_notes"}
+                progressed = bool(new_ids) or len(tools.evidence_index) > evidence_before or memory_after != memory_before
                 stalled = 0 if progressed else stalled + 1
                 if result.done:
                     reason = "no_remaining_work"
@@ -158,6 +207,7 @@ class DiscoveryRunner:
             run["status"] = "failed"
             run["termination_reason"] = "invalid_topology"
             run["error"] = str(exc)
+            control.emit("error", error=run["error"], phase="topology")
         except Exception as exc:  # noqa: BLE001 - recorded for operators
             run["status"] = "failed"
             run["termination_reason"] = "error"
@@ -169,6 +219,7 @@ class DiscoveryRunner:
         run["usage"] = control.usage.to_dict()
         run["ended_at"] = utcnow()
         run["elapsed_seconds"] = round(control.elapsed_seconds, 1)
+        run["story"] = run_story(run)
         self.store.save_run(run)
         self.store.append_event(run_id, {"type": "run_finished", "status": run["status"], "reason": run["termination_reason"]})
         return run

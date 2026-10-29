@@ -30,6 +30,9 @@ WORKSPACE_FILENAME = "workspace.toml"
 TEMPLATE_NAME = "_template"
 ACTIVE_FILENAME = ".active"
 WORKSPACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+# conservative: only medium/high-confidence proposals are accepted.
+# exploratory: low-confidence hypotheses are accepted too, clearly tiered for SME triage.
+MODES = ("conservative", "exploratory")
 
 
 class WorkspaceError(ValueError):
@@ -41,7 +44,7 @@ class RunLimits:
     """Budgets that bound one autonomous run (FR-007, NFR-004)."""
 
     max_minutes: float = 10.0
-    max_iterations: int = 20
+    max_iterations: int = 3
     max_model_calls: int = 60
     max_tool_calls: int = 400
     max_cost_usd: float = 2.0
@@ -49,10 +52,16 @@ class RunLimits:
     query_timeout_seconds: int = 30
     max_join_keys: int = 200_000
 
+    def __post_init__(self) -> None:
+        if isinstance(self.max_iterations, bool) or not isinstance(self.max_iterations, int) or not 1 <= self.max_iterations <= 99:
+            raise ValueError("max_iterations must be an integer between 1 and 99")
+
     def merged(self, overrides: dict[str, Any] | None) -> "RunLimits":
         data = dict(self.__dict__)
         for key, value in (overrides or {}).items():
             if key in data and value is not None:
+                if key == "max_iterations" and (isinstance(value, bool) or not isinstance(value, (int, str))):
+                    raise ValueError("max_iterations must be an integer between 1 and 99")
                 data[key] = type(data[key])(value)
         return RunLimits(**data)
 
@@ -107,6 +116,7 @@ class Settings:
     sources: dict[str, SourceConfig]
     topology_file: Path
     planner: str = "auto"
+    mode: str = "conservative"
     api_token: str | None = None
     description: str = ""
 
@@ -269,6 +279,14 @@ def load_settings(root: Path | None = None, workspace: str | None = None) -> Set
             "file", "context/topology.md" if (ws_dir / "context" / "topology.md").exists() else "topology.md"
         ),
         planner=str(section("agent").get("planner", "auto")),
+        mode=_mode(section("agent").get("mode", "conservative")),
         api_token=_env("DDG_API_TOKEN"),
         description=str(ws.get("workspace", {}).get("description", "")),
     )
+
+
+def _mode(value: Any) -> str:
+    mode = str(value).lower()
+    if mode not in MODES:
+        raise WorkspaceError(f"[agent] mode must be one of {', '.join(MODES)}, got '{value}'")
+    return mode

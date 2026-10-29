@@ -24,3 +24,7 @@ workspaces/*/metadata/
 workspaces/*/sandbox/
 workspaces/*/graph_output/
 workspaces/*/data/*.sqlite
+workspaces/*/dictionary/exports/
+workspaces/*/dictionary/.lock
+workspaces/*/archive/
+workspaces/telecom

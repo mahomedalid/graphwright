@@ -14,7 +14,7 @@ from conftest import approve_all, retail_db
 
 def _discover_and_approve(settings, store, only=None):
     runner = DiscoveryRunner(settings, store)
-    runner.execute(runner.create_run("retail", "heuristic")["id"])
+    runner.execute(runner.create_run("retail", "heuristic", {"max_iterations": 20})["id"])
     for c in store.list_candidates("pending"):
         name = (c.get("mapping") or {}).get("node_type") or (c.get("mapping") or {}).get("edge_type")
         if only is None or name in only:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import time
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 def utcnow() -> str:
@@ -125,12 +128,19 @@ class ProposalRejected(Exception):
     """Raised when a candidate proposal violates feedback or validation rules."""
 
 
-def mapping_fingerprint(kind: str, mapping: dict | None, hypothesis: str) -> str:
+def mapping_fingerprint(kind: str, mapping: dict | None, hypothesis: str, source: str | None = None) -> str:
+    """Identity of an interpretation. Includes the source so the same mapping on a new source is not a duplicate."""
     if mapping:
         relevant = {k: v for k, v in mapping.items() if k not in ("notes",)}
-        return short_hash({"kind": kind, "mapping": relevant})
+        return short_hash({"kind": kind, "mapping": relevant, "source": source})
     normalized = " ".join(hypothesis.lower().split())
-    return short_hash({"kind": kind, "hypothesis": normalized})
+    return short_hash({"kind": kind, "hypothesis": normalized, "source": source})
+
+
+def candidate_fingerprint(candidate: dict) -> str:
+    return mapping_fingerprint(
+        candidate["kind"], candidate.get("mapping"), candidate.get("hypothesis", ""), candidate.get("scope", {}).get("source")
+    )
 
 
 def evidence_fingerprint(evidence: list[dict]) -> str:
@@ -174,10 +184,11 @@ class Store:
     def add_candidate(self, candidate: dict) -> dict:
         """Persist a new candidate after feedback-reuse checks (FR-006)."""
         with file_lock(self._lock_path):
-            fingerprint = mapping_fingerprint(candidate["kind"], candidate.get("mapping"), candidate["hypothesis"])
+            fingerprint = candidate_fingerprint(candidate)
             ev_fp = evidence_fingerprint(candidate.get("evidence", []))
             for existing in self.list_candidates():
-                if existing.get("fingerprint") != fingerprint:
+                # Recompute instead of trusting the stored value so older records (pre source-aware) compare correctly.
+                if candidate_fingerprint(existing) != fingerprint:
                     continue
                 status = existing.get("status")
                 if status in ("pending", "approved"):
@@ -347,15 +358,39 @@ class Store:
     def append_event(self, run_id: str, event: dict) -> None:
         path = self.run_dir(run_id) / "events.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"at": utcnow(), "run_id": run_id, **event}, default=str) + "\n")
+        record = (json.dumps({"at": utcnow(), "run_id": run_id, **event}, default=str) + "\n").encode("utf-8")
+        with file_lock(path.with_suffix(".lock")):
+            with path.open("a+b") as handle:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell():
+                    handle.seek(-1, os.SEEK_END)
+                    if handle.read(1) != b"\n":
+                        handle.write(b"\n")
+                handle.write(record)
 
     def read_events(self, run_id: str, limit: int = 500) -> list[dict]:
         path = self.run_dir(run_id) / "events.jsonl"
-        if not path.exists():
+        if limit <= 0 or not path.exists():
             return []
-        lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
-        return [json.loads(line) for line in lines if line.strip()]
+        # Split bytes first: an in-flight append can end halfway through a UTF-8 character.
+        lines = path.read_bytes().split(b"\n")[:-1]
+        events: list[dict] = []
+        for index in range(len(lines) - 1, -1, -1):
+            line = lines[index]
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                logger.warning("Skipping malformed event record: run_id=%s line=%s", run_id, index + 1)
+                continue
+            if not isinstance(event, dict):
+                logger.warning("Skipping non-object event record: run_id=%s line=%s", run_id, index + 1)
+                continue
+            events.append(event)
+            if len(events) == limit:
+                break
+        return events[::-1]
 
     def save_evidence(self, run_id: str, evidence: dict) -> None:
         atomic_write_json(self.run_dir(run_id) / "evidence" / f"{evidence['id']}.json", evidence)
@@ -372,3 +407,68 @@ class Store:
 
     def cancel_requested(self, run_id: str) -> bool:
         return (self.run_dir(run_id) / "cancel").exists()
+
+    # ----- reset ------------------------------------------------------
+    RESET_SCOPES = ("runs", "pending", "rejected", "approved", "metadata")
+
+    def reset_preview(self) -> dict:
+        candidates = self.list_candidates()
+        return {
+            "runs": len(list(self.settings.runs_dir.glob("run-*"))),
+            "pending": sum(1 for c in candidates if c["status"] == "pending"),
+            "rejected": sum(1 for c in candidates if c["status"] == "rejected"),
+            "approved": sum(1 for c in candidates if c["status"] == "approved"),
+            "metadata": sum(1 for p in self.settings.metadata_dir.iterdir()) if self.settings.metadata_dir.exists() else 0,
+        }
+
+    def reset(self, scopes: list[str], actor: str, active_run_ids: list[str] | None = None) -> dict:
+        """Archive discovery state so the next run starts fresh. Nothing is deleted.
+
+        runs: run history, checkpoints, evidence (also clears dictionary column profiles)
+        pending / rejected / approved: candidates by status (approved also archives their facts)
+        metadata: source inventories and the cached topology parse
+        Dictionary annotations, topology, context documents, and configuration are never touched.
+        """
+        import shutil
+
+        unknown = set(scopes) - set(self.RESET_SCOPES)
+        if unknown or not scopes:
+            raise ValueError(f"Choose one or more scopes from {', '.join(self.RESET_SCOPES)}")
+        if not actor or not actor.strip():
+            raise ValueError("actor is required")
+        active = [r["id"] for r in self.list_runs() if r.get("status") in ("queued", "running", "stopping")]
+        active += [r for r in (active_run_ids or []) if r not in active]
+        if active:
+            raise ConflictError(f"Cancel active runs before resetting: {', '.join(active)}")
+
+        stamp = utcnow().replace(":", "").replace("-", "").replace("+0000", "Z")
+        archive = self.settings.workspace_dir / "archive" / f"reset-{stamp}-{uuid.uuid4().hex[:4]}"
+        moved: dict[str, int] = {}
+
+        def move(path: Path, group: str) -> None:
+            target = archive / path.relative_to(self.settings.workspace_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(target))
+            moved[group] = moved.get(group, 0) + 1
+
+        with file_lock(self._lock_path):
+            if "runs" in scopes:
+                for path in sorted(self.settings.runs_dir.glob("run-*")):
+                    move(path, "runs")
+            statuses = [s for s in ("pending", "rejected", "approved") if s in scopes]
+            for candidate in self.list_candidates():
+                if candidate["status"] not in statuses:
+                    continue
+                move(self._candidate_path(candidate["id"]), candidate["status"])
+                if candidate["status"] == "approved":
+                    fact = self.settings.approved_dir / ("fact-" + candidate["id"].removeprefix("cand-") + ".json")
+                    if fact.exists():
+                        move(fact, "facts")
+            if "metadata" in scopes and self.settings.metadata_dir.exists():
+                for path in sorted(self.settings.metadata_dir.iterdir()):
+                    move(path, "metadata")
+            manifest = {"archived_at": utcnow(), "actor": actor.strip(), "scopes": sorted(scopes), "moved": moved,
+                        "path": str(archive)}
+            if moved:
+                atomic_write_json(archive / "reset.json", manifest)
+            return manifest

@@ -74,7 +74,7 @@ function showTab(name) {
   document.querySelectorAll(".tab").forEach((s) => s.classList.toggle("hidden", s.id !== `tab-${name}`));
   location.hash = name;
   if (!state.ws) return;
-  ({ runs: loadRuns, review: loadCandidates, facts: loadFacts, graph: loadGraphFiles, topology: loadTopology })[name]?.();
+  ({ runs: loadRuns, review: loadCandidates, facts: loadFacts, dictionary: loadDictionary, graph: loadGraphFiles, topology: loadTopology })[name]?.();
 }
 
 // ---------- workspaces ----------
@@ -122,17 +122,23 @@ async function loadWorkspaceStatus() {
   const topo = info?.topology;
   $("#workspace-info").textContent = [
     s.description,
-    topo ? `topology ${topo.is_valid ? "valid" : `invalid (${topo.errors} error${topo.errors === 1 ? "" : "s"})`}` : "",
+    topo ? `topology ${topo.parsing_mode === "pending_foundry" ? "awaiting Foundry parsing" : topo.is_valid ? "valid" : `invalid (${topo.errors} error${topo.errors === 1 ? "" : "s"})`}` : "",
     `${s.sources.length} source${s.sources.length === 1 ? "" : "s"}`,
   ].filter(Boolean).join(" · ");
   $("#status-line").textContent = `Planner: ${state.status.foundry_configured ? "Foundry configured" : "offline heuristic (Foundry not configured)"} · sample rows ≤ ${s.sampling.max_rows}`;
-  for (const id of ["#run-source", "#facts-source", "#meta-source"]) {
+  for (const id of ["#run-source", "#facts-source", "#meta-source", "#dict-source"]) {
     const select = clear($(id));
     s.sources.forEach((src) => select.append(h("option", { value: src.name }, `${src.name} (${src.type})`)));
   }
   const noSources = !s.sources.length;
+  $("#run-form [name=max_iterations]").placeholder = String(s.limits.max_iterations);
+  $("#run-mode option[value='']").textContent = `Workspace default (${s.default_mode || "conservative"})`;
   $("#run-form button[type=submit]").disabled = noSources;
   $("#generate-btn").disabled = noSources;
+  $("#dict-profile-btn").disabled = noSources;
+  $("#dict-export-btn").disabled = noSources;
+  state.dict = null;
+  state.dictTable = null;
   $("#no-sources").classList.toggle("hidden", !noSources);
   $("#no-sources-path").textContent = `${s.path}${s.path.includes("\\") ? "\\" : "/"}workspace.toml`;
 }
@@ -171,58 +177,189 @@ async function loadStatus() {
   state.status = await api("/api/status");
 }
 
-// ---------- runs ----------
-let runPoll = null;
-async function loadRuns() {
-  const runs = await wsApi("/runs");
-  const tbody = clear($("#runs-table tbody"));
-  for (const run of runs) {
-    const active = ["queued", "running", "stopping"].includes(run.status);
-    tbody.append(h("tr", {},
-      h("td", {}, h("button", { className: "link", onclick: () => selectRun(run.id) }, run.id)),
-      h("td", {}, pill(run.status)),
-      h("td", {}, run.source),
-      h("td", {}, run.planner || ""),
-      h("td", {}, run.iterations),
-      h("td", {}, run.candidates),
-      h("td", {}, run.termination_reason || ""),
-      h("td", {},
-        active ? h("button", { onclick: () => cancelRun(run.id) }, "Cancel") : null,
-        !active ? h("button", { onclick: () => resumeRun(run.id) }, "Resume") : null),
-    ));
+// ---------- safe markdown (DOM nodes only; never innerHTML) ----------
+function mdInline(text) {
+  const out = [];
+  const re = /(\*\*[^*]+\*\*|__[^_]+__|`[^`]+`|\*[^*\s][^*]*\*)/g;
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    const tok = m[0];
+    if (tok.startsWith("**") || tok.startsWith("__")) out.push(h("strong", {}, tok.slice(2, -2)));
+    else if (tok.startsWith("`")) out.push(h("code", {}, tok.slice(1, -1)));
+    else out.push(h("em", {}, tok.slice(1, -1)));
+    last = m.index + tok.length;
   }
-  const anyActive = runs.some((r) => ["queued", "running", "stopping"].includes(r.status));
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+function renderMarkdown(text) {
+  const root = h("div", { className: "md" });
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  let para = [];
+  const stack = []; // [{ indent, el }]
+  const flushPara = () => { if (para.length) { root.append(h("p", {}, mdInline(para.join(" ")))); para = []; } };
+  const closeLists = (indent = -1) => { while (stack.length && stack[stack.length - 1].indent > indent) stack.pop(); };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*```/.test(line)) {
+      flushPara(); closeLists();
+      const code = [];
+      for (i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) code.push(lines[i]);
+      root.append(h("pre", {}, code.join("\n")));
+      continue;
+    }
+    const heading = line.match(/^\s*(#{1,6})\s+(.*)$/);
+    const item = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+    if (!line.trim()) {
+      flushPara();
+      const next = lines.slice(i + 1).find((l) => l.trim());
+      // Blank lines between items (or before indented continuation) keep the list open.
+      if (!next || !(/^(\s*)([-*+]|\d+[.)])\s+/.test(next) || (stack.length && /^\s+\S/.test(next)))) closeLists();
+      continue;
+    }
+    if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) { flushPara(); closeLists(); root.append(h("hr", {})); continue; }
+    if (heading) {
+      flushPara(); closeLists();
+      root.append(h(`h${Math.min(6, heading[1].length + 3)}`, {}, mdInline(heading[2])));
+      continue;
+    }
+    if (item) {
+      flushPara();
+      const indent = item[1].replace(/\t/g, "  ").length;
+      const ordered = /\d/.test(item[2]);
+      closeLists(indent);
+      let top = stack[stack.length - 1];
+      if (!top || top.indent < indent) {
+        const start = ordered ? parseInt(item[2], 10) : null;
+        const list = h(ordered ? "ol" : "ul", start && start !== 1 ? { start } : {});
+        const parent = top ? (top.el.lastElementChild || top.el) : root;
+        parent.append(list);
+        stack.push({ indent, el: list });
+        top = stack[stack.length - 1];
+      }
+      top.el.append(h("li", {}, mdInline(item[3])));
+      continue;
+    }
+    if (stack.length && /^\s+\S/.test(line)) { // continuation of a list item
+      stack[stack.length - 1].el.lastElementChild?.append(" ", ...mdInline(line.trim()));
+      continue;
+    }
+    closeLists();
+    para.push(line.trim());
+  }
+  flushPara();
+  return root;
+}
+
+// ---------- runs ----------
+function iterationView(it, openSet) {
+  const activity = it.activity || {};
+  const proposed = activity.proposed || [];
+  const details = it.summary && it.summary !== it.story
+    ? h("details", { className: "iteration-details", "data-iteration": String(it.iteration), open: openSet.has(String(it.iteration)) },
+        h("summary", {}, `Agent notes (${Math.max(1, Math.round(it.summary.length / 1000))}k characters)`),
+        it.facts ? h("p", { className: "small muted" }, h("strong", {}, "Recorded activity: "), it.facts) : null,
+        renderMarkdown(it.summary))
+    : null;
+  return h("li", { className: "iteration" },
+    h("div", { className: "iteration-head" },
+      h("span", { className: "iteration-step" }, `Step ${it.iteration}`),
+      h("span", { className: "small muted" }, `${it.duration_seconds ?? "?"}s`)),
+    h("p", { className: "story" }, it.story || "No summary recorded."),
+    proposed.length ? h("div", { className: "chips" }, proposed.map((p) =>
+      h("button", { type: "button", className: "chip proposal", title: p.id, onclick: () => { showTab("review"); setTimeout(() => selectCandidate(p.id), 300); } },
+        tierBadge(p.tier), " ", p.label))) : null,
+    it.proposal_errors?.length ? h("details", { className: "small" },
+      h("summary", { className: "warn" }, `${it.proposal_errors.length} idea${it.proposal_errors.length === 1 ? "" : "s"} held back`),
+      h("ul", {}, it.proposal_errors.map((e) => h("li", {}, e)))) : null,
+    details);
+}
+let runPoll = null;
+let runLoadVersion = 0;
+const RUN_POLL_INTERVAL_MS = 5000;
+async function loadRuns() {
   clearTimeout(runPoll);
-  if (anyActive) runPoll = setTimeout(() => { loadRuns(); if (state.selectedRun) selectRun(state.selectedRun, true); refreshBadge(); }, 2500);
+  const version = ++runLoadVersion;
+  const workspace = state.ws;
+  let anyActive = true;
+  try {
+    const runs = await wsApi("/runs");
+    if (workspace !== state.ws || version !== runLoadVersion) return;
+    anyActive = runs.some((r) => ["queued", "running", "stopping"].includes(r.status));
+    const tbody = clear($("#runs-table tbody"));
+    for (const run of runs) {
+      const active = ["queued", "running", "stopping"].includes(run.status);
+      tbody.append(h("tr", {},
+        h("td", {}, h("button", { className: "link", onclick: () => selectRun(run.id) }, run.id)),
+        h("td", {}, pill(run.status)),
+        h("td", {}, run.source),
+        h("td", {}, run.planner || "", run.mode ? h("div", { className: "small muted" }, run.mode) : null),
+        h("td", {}, run.iterations),
+        h("td", {}, run.candidates),
+        h("td", {}, run.termination_reason || ""),
+        h("td", {},
+          active ? h("button", { onclick: () => cancelRun(run.id) }, "Cancel") : null,
+          !active ? h("button", { onclick: () => resumeRun(run.id) }, "Resume") : null),
+      ));
+    }
+    if (state.selectedRun) await selectRun(state.selectedRun, true);
+    if (workspace === state.ws && version === runLoadVersion) await refreshBadge();
+  } catch (e) {
+    if (workspace === state.ws && version === runLoadVersion) {
+      anyActive = true;
+      toast(`Run refresh failed: ${e.message}. Retrying in 5 seconds.`, true);
+    }
+  } finally {
+    if (workspace === state.ws && version === runLoadVersion && anyActive) {
+      runPoll = setTimeout(loadRuns, RUN_POLL_INTERVAL_MS);
+    }
+  }
 }
 
 async function selectRun(runId, quiet = false) {
   state.selectedRun = runId;
+  const workspace = state.ws;
   const run = await wsApi(`/runs/${encodeURIComponent(runId)}?events=150`);
-  const panel = clear($("#run-detail"));
+  if (workspace !== state.ws || state.selectedRun !== runId) return;
+  const panel = $("#run-detail");
+  const eventsOpen = quiet ? (panel.querySelector("#run-events")?.open ?? false) : false;
+  const openSet = new Set(quiet ? [...panel.querySelectorAll(".iteration-details[open]")].map((d) => d.dataset.iteration) : []);
+  const metaOpen = quiet ? (panel.querySelector(".run-meta")?.open ?? false) : false;
+  clear(panel);
   panel.classList.remove("hidden");
   const u = run.usage || {};
+  const eventRows = run.events.slice().reverse().map((ev) => {
+    const details = Object.fromEntries(
+      Object.entries(ev).filter(([key]) => !["at", "run_id", "type", "tool", "args", "trace"].includes(key))
+    );
+    return h("tr", {},
+      h("td", { className: "small muted" }, fmtTime(ev.at)), h("td", {}, ev.type), h("td", {}, ev.tool || ""),
+      h("td", { className: "small" }, JSON.stringify(details)));
+  });
   appendAll(panel, 
     h("h2", {}, `Run ${run.id} `, pill(run.status)),
+    run.story ? h("p", { className: "story run-story" }, run.story) : null,
+    h("details", { className: "run-meta", open: metaOpen }, h("summary", {}, "Run settings and usage"),
     h("dl", { className: "kv" },
       h("dt", {}, "Source"), h("dd", {}, run.source),
-      h("dt", {}, "Planner"), h("dd", {}, run.planner || ""),
+      h("dt", {}, "Planner"), h("dd", {}, (run.planner || "") + (run.mode ? ` · ${run.mode} mode` : "")),
       h("dt", {}, "Topology version"), h("dd", {}, run.topology_version || ""),
       h("dt", {}, "Resumed from"), h("dd", {}, run.resumed_from || "—"),
       h("dt", {}, "Limits"), h("dd", {}, Object.entries(run.limits || {}).map(([k, v]) => `${k}=${v}`).join(", ")),
       h("dt", {}, "Usage"), h("dd", {}, `${u.tool_calls ?? 0} tool calls · ${u.queries ?? 0} queries · ${u.model_calls ?? 0} model calls · ${u.input_tokens ?? 0}/${u.output_tokens ?? 0} tokens · $${(u.cost_usd ?? 0).toFixed(4)}`),
       h("dt", {}, "Termination"), h("dd", {}, run.termination_reason || "—"),
-      run.error ? [h("dt", {}, "Error"), h("dd", { className: "error" }, run.error)] : null,
-    ),
-    h("h3", {}, "Iterations"),
-    h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "#"), h("th", {}, "Summary"), h("th", {}, "New candidates"), h("th", {}, "Review snapshot"), h("th", {}, "Seconds"))),
-      h("tbody", {}, (run.iterations || []).map((it) => h("tr", {},
-        h("td", {}, it.iteration), h("td", {}, it.summary || "", it.proposal_errors?.length ? h("div", { className: "warn small" }, `Blocked proposals: ${it.proposal_errors.join(" | ")}`) : null),
-        h("td", {}, (it.new_candidates || []).join(", ")), h("td", {}, it.review_snapshot_version), h("td", {}, it.duration_seconds))))),
-    h("details", {}, h("summary", {}, `Events (${run.events.length})`),
-      h("div", { className: "table-wrap" }, h("table", {}, h("tbody", {}, run.events.slice().reverse().map((ev) => h("tr", {},
-        h("td", { className: "small muted" }, fmtTime(ev.at)), h("td", {}, ev.type), h("td", {}, ev.tool || ""),
-        h("td", { className: "small" }, JSON.stringify(ev.summary || ev.error || ev.summary || ev.reason || ev.message || "")))))))),
+      run.events.length ? [h("dt", {}, "Latest activity"), h("dd", {},
+        `${run.events[run.events.length - 1].type} · ${fmtTime(run.events[run.events.length - 1].at)}`)] : null,
+    )),
+    run.error ? h("p", { className: "error" }, run.error) : null,
+    h("h3", {}, `Steps (${(run.iterations || []).length})`),
+    (run.iterations || []).length
+      ? h("ol", { className: "iterations" }, run.iterations.map((it) => iterationView(it, openSet)))
+      : h("p", { className: "muted" }, "No steps completed yet."),
+    h("details", { id: "run-events", open: eventsOpen }, h("summary", {}, `Technical events (${run.events.length})`),
+      h("div", { className: "table-wrap" }, h("table", {}, h("tbody", {}, eventRows)))),
   );
   if (!quiet) panel.scrollIntoView({ behavior: "smooth" });
 }
@@ -245,7 +382,7 @@ async function startRun(event) {
   const limits = {};
   for (const key of ["max_minutes", "max_iterations", "max_cost_usd"]) if (form.get(key)) limits[key] = Number(form.get(key));
   try {
-    const run = await wsApi("/runs", { method: "POST", body: JSON.stringify({ source: form.get("source"), planner: form.get("planner") || null, limits }) });
+    const run = await wsApi("/runs", { method: "POST", body: JSON.stringify({ source: form.get("source"), planner: form.get("planner") || null, mode: form.get("mode") || null, limits }) });
     toast(`Started ${run.id}`);
     loadRuns(); selectRun(run.id);
   } catch (e) { toast(e.message, true); }
@@ -253,18 +390,33 @@ async function startRun(event) {
 
 // ---------- review ----------
 async function refreshBadge() {
+  const workspace = state.ws;
   const pending = await wsApi("/candidates?status=pending");
+  if (workspace !== state.ws) return;
   $("#pending-badge").textContent = pending.length ? String(pending.length) : "";
+}
+
+const TIER_ORDER = { high: 0, medium: 1, low: 2 };
+
+function tierBadge(tier) {
+  if (!tier) return null;
+  return h("span", { className: `tier tier-${tier}`, title: `${tier} confidence` }, tier);
 }
 
 async function loadCandidates() {
   const status = $("#review-status").value;
-  const items = await wsApi(`/candidates${status ? `?status=${status}` : ""}`);
+  const tier = $("#review-tier").value;
+  const params = new URLSearchParams();
+  if (status) params.set("status", status);
+  if (tier) params.set("tier", tier);
+  const items = await wsApi(`/candidates${params.toString() ? `?${params}` : ""}`);
+  // Highest confidence first so SMEs can clear easy ones quickly; ties keep creation order.
+  items.sort((a, b) => (TIER_ORDER[a.confidence_tier] ?? 3) - (TIER_ORDER[b.confidence_tier] ?? 3));
   const list = clear($("#candidate-list"));
   if (!items.length) list.append(h("p", { className: "muted" }, "No candidates."));
   for (const c of items) {
     list.append(h("button", { className: "item", "aria-current": String(state.selectedCandidate === c.id), onclick: () => selectCandidate(c.id) },
-      h("span", { className: "title" }, c.hypothesis),
+      h("span", { className: "title" }, tierBadge(c.confidence_tier), " ", c.hypothesis),
       h("span", { className: "small muted" }, `${c.kind} · `, pill(c.status), ` · ${c.scope?.source || ""} · ${c.id}`)));
   }
   refreshBadge();
@@ -295,9 +447,13 @@ async function selectCandidate(id) {
   const panel = clear($("#candidate-detail"));
   appendAll(panel, 
     h("h2", {}, c.hypothesis),
-    h("p", {}, pill(c.status), ` ${c.kind} · version ${c.version} · confidence ${c.confidence ?? "n/a"} (not proof)`),
+    h("p", {}, pill(c.status), " ", tierBadge(c.confidence_tier), ` ${c.kind} · version ${c.version}` +
+      (c.discovery_mode ? ` · proposed in ${c.discovery_mode} mode` : "")),
+    c.confidence_reasons?.length ? h("div", { className: `tier-reasons tier-${c.confidence_tier}` },
+      h("strong", {}, `Why ${c.confidence_tier} confidence:`),
+      h("ul", {}, c.confidence_reasons.map((r) => h("li", {}, r)))) : null,
     h("dl", { className: "kv" },
-      h("dt", {}, "Rationale"), h("dd", {}, c.rationale || ""),
+      h("dt", {}, "Rationale"), h("dd", {}, renderMarkdown(c.rationale || "")),
       h("dt", {}, "Source refs"), h("dd", {}, (c.source_refs || []).join(", ")),
       h("dt", {}, "Run / iteration"), h("dd", {}, `${c.run_id} / ${c.iteration}`),
       h("dt", {}, "Topology version"), h("dd", {}, c.topology_version),
@@ -514,7 +670,8 @@ function renderTextView() {
 async function loadTopology() {
   const t = await wsApi("/topology");
   const panel = clear($("#topology-view"));
-  appendAll(panel, h("h2", {}, `Topology: ${t.title} `, h("span", { className: `pill ${t.is_valid ? "completed" : "failed"}` }, t.is_valid ? "valid" : "invalid")),
+  const pending = t.parsing_mode === "pending_foundry";
+  appendAll(panel, h("h2", {}, `Topology: ${t.title} `, h("span", { className: `pill ${pending ? "queued" : t.is_valid ? "completed" : "failed"}` }, pending ? "awaiting Foundry parsing" : t.is_valid ? "valid" : "invalid")),
     h("p", { className: "small muted" }, `Workspace ${state.ws} · version ${t.version} · ${t.source_path}`),
     t.issues.length ? h("ul", {}, t.issues.map((i) => h("li", { className: i.level === "error" ? "error" : "warn" }, `${i.level}${i.line ? ` (line ${i.line})` : ""}: ${i.message}`))) : null,
     h("h3", {}, "Node types"),
@@ -542,6 +699,287 @@ async function loadMetadata() {
   }
 }
 
+// ---------- data dictionary ----------
+function dictAuthor() {
+  const author = $("#dict-author").value.trim();
+  if (author) localStorage.setItem("ddg-reviewer", author);
+  return author;
+}
+
+async function loadDictionary() {
+  const source = $("#dict-source").value;
+  $("#dict-author").value = $("#dict-author").value || localStorage.getItem("ddg-reviewer") || "";
+  if (!source) {
+    clear($("#dict-tables")).append(h("p", { className: "muted" }, "This workspace has no sources yet."));
+    clear($("#dict-detail"));
+    $("#dict-summary").textContent = "";
+    return;
+  }
+  try {
+    state.dict = await wsApi(`/dictionary/${encodeURIComponent(source)}`);
+  } catch (e) { toast(e.message, true); return; }
+  const s = state.dict.summary;
+  $("#dict-summary").textContent = s.tables
+    ? `${s.tables} tables (${s.tables_described} described, ${s.tables_mapped} mapped) · ${s.columns} columns (${s.columns_described} described, ${s.columns_profiled} profiled)` +
+      (s.pending_suggestions ? ` · ${s.pending_suggestions} pending suggestion${s.pending_suggestions === 1 ? "" : "s"}` : "") +
+      ` · inventory ${state.dict.inventory_observed_at ? fmtTime(state.dict.inventory_observed_at) : "not collected yet"}`
+    : "No tables discovered yet. Start a discovery run or select Profile columns.";
+  renderDictionaryList();
+  const keep = state.dictTable && state.dict.tables.some((t) => t.name === state.dictTable);
+  if (keep) renderDictionaryTable(state.dictTable);
+  else clear($("#dict-detail")).append(h("p", { className: "muted" }, "Select a table to see what we know about it."));
+}
+
+function dictMatches(t) {
+  const q = $("#dict-filter").value.trim().toLowerCase();
+  const show = $("#dict-show").value;
+  if (q && !t.name.toLowerCase().includes(q) && !t.columns.some((c) => c.name.toLowerCase().includes(q))) return false;
+  if (show === "mapped" && !t.roles.length) return false;
+  if (show === "undescribed" && t.description && t.coverage.described === t.coverage.columns) return false;
+  if (show === "suggestions" && !t.suggestions.length && !t.columns.some((c) => c.suggestions.length)) return false;
+  return true;
+}
+
+function renderDictionaryList() {
+  const list = clear($("#dict-tables"));
+  const tables = (state.dict?.tables || []).filter(dictMatches);
+  if (!tables.length) { list.append(h("p", { className: "muted" }, "No tables match.")); return; }
+  for (const t of tables) {
+    const roles = t.roles.map((r) => r.node_type || r.edge_type).filter(Boolean);
+    list.append(h("button", { className: "item", "aria-current": String(state.dictTable === t.name), onclick: () => renderDictionaryTable(t.name) },
+      h("span", { className: "title" }, t.name),
+      h("span", { className: "small muted" },
+        `${t.row_count ?? "?"} rows · ${t.coverage.described}/${t.coverage.columns} described · ${t.coverage.profiled}/${t.coverage.columns} profiled`,
+        roles.length ? ` · ${[...new Set(roles)].join(", ")}` : "",
+        t.in_inventory ? "" : " · not in latest inventory")));
+  }
+}
+
+function roleChip(r) {
+  return h("span", { className: `chip ${r.status}`, title: r.ref }, r.label + (r.status === "approved" ? "" : ` (${r.status})`));
+}
+
+function profileCell(p) {
+  if (!p) return h("span", { className: "muted small" }, "not profiled");
+  return h("div", { className: "small" },
+    `${p.null_pct ?? "?"}% null · ${p.distinct_count ?? "?"} distinct${p.unique ? " · unique" : ""}`,
+    p.value_shapes?.length ? h("div", { className: "muted" }, `shapes: ${p.value_shapes.join(", ")}`) : null,
+    p.top_values?.length ? h("div", { className: "muted" }, `top: ${p.top_values.slice(0, 3).map((v) => `${v.value} (${v.count})`).join(", ")}`) : null);
+}
+
+function statusPill(status, source) {
+  if (!status) return h("span", { className: "muted small" }, "undocumented");
+  const cls = { verified: "completed", provisional: "pending", deprecated: "failed" }[status] || "";
+  return h("span", { className: `pill ${cls}`, title: source ? `from ${source}` : "" }, status);
+}
+
+function valuesToText(values) { return Object.entries(values || {}).map(([k, v]) => `${k} = ${v}`).join("\n"); }
+
+function textToValues(text) {
+  const values = {};
+  for (const line of text.split("\n")) {
+    const i = line.indexOf("=");
+    if (i > 0) values[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  return values;
+}
+
+function editorForm(entry, { isColumn, onSave, onCancel }) {
+  const description = h("textarea", { "aria-label": "Description" });
+  description.value = entry.description_source === "sme" ? entry.description : (entry.description || "");
+  const notes = h("textarea", { "aria-label": "Notes" });
+  notes.value = entry.notes || "";
+  const status = h("select", { "aria-label": "Status" }, ["provisional", "verified", "deprecated"].map((s) => h("option", { value: s }, s)));
+  status.value = entry.status || "provisional";
+  const values = isColumn ? h("textarea", { "aria-label": "Value meanings", placeholder: "C = Wireless\nO = Internet" }) : null;
+  if (values) values.value = valuesToText(entry.values);
+  const form = h("form", { className: "dict-editor" },
+    h("label", {}, "Description", description),
+    values ? h("label", {}, "Value meanings (one code = meaning per line)", values) : null,
+    h("label", {}, "Notes (assumptions, caveats, open questions)", notes),
+    h("label", {}, "Status", status),
+    h("div", { className: "row" },
+      h("button", { type: "submit", className: "primary" }, "Save"),
+      h("button", { type: "button", onclick: onCancel }, "Cancel")));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const body = { description: description.value, notes: notes.value, status: status.value };
+    if (values) body.values = textToValues(values.value);
+    onSave(body);
+  });
+  setTimeout(() => description.focus(), 0);
+  return form;
+}
+
+async function saveDictionaryEntry(table, column, entry, changes) {
+  const author = dictAuthor();
+  if (!author) { toast("Enter your name in Editor first", true); $("#dict-author").focus(); return false; }
+  const source = encodeURIComponent($("#dict-source").value);
+  const path = `/dictionary/${source}/tables/${encodeURIComponent(table)}` + (column ? `/columns/${encodeURIComponent(column)}` : "");
+  try {
+    await wsApi(path, { method: "PUT", body: JSON.stringify({ ...changes, author, expected_revision: entry.revision || 0 }) });
+    toast(`Saved ${column ? `${table}.${column}` : table}`);
+    await loadDictionary();
+    return true;
+  } catch (e) {
+    toast(e.status === 409 ? `Someone else edited this entry. Reloaded; please re-apply your change.` : e.message, true);
+    if (e.status === 409) await loadDictionary();
+    return false;
+  }
+}
+
+function suggestionList(items) {
+  if (!items?.length) return null;
+  return h("div", { className: "suggestions" }, items.map((s) => h("div", { className: "small" },
+    h("span", { className: "pill pending" }, "suggested"), " ", s.description || s.hypothesis,
+    Object.keys(s.values || {}).length ? ` (${Object.entries(s.values).map(([k, v]) => `${k} = ${v}`).join(", ")})` : "",
+    " ", h("button", { type: "button", className: "inline-link", onclick: () => { showTab("review"); setTimeout(() => selectCandidate(s.ref), 300); } }, "Review"))));
+}
+
+function renderDictionaryTable(name) {
+  state.dictTable = name;
+  document.querySelectorAll("#dict-tables .item").forEach((el) => el.setAttribute("aria-current", String(el.querySelector(".title")?.textContent === name)));
+  const t = state.dict.tables.find((x) => x.name === name);
+  const panel = clear($("#dict-detail"));
+  if (!t) return;
+  const descriptionBlock = h("div", { id: "dict-table-description" });
+  const showDescription = () => {
+    clear(descriptionBlock);
+    appendAll(descriptionBlock,
+      h("p", {}, t.description || h("span", { className: "muted" }, "No description yet."),
+        t.description_source && t.description_source !== "sme" ? h("span", { className: "muted small" }, ` (from ${t.description_source})`) : null),
+      t.notes ? h("p", { className: "small" }, h("strong", {}, "Notes: "), t.notes) : null,
+      t.rules?.length ? h("ul", { className: "small" }, t.rules.map((r) => h("li", {}, r))) : null,
+      t.updated_by ? h("p", { className: "muted small" }, `Edited by ${t.updated_by} · ${fmtTime(t.updated_at)} · revision ${t.revision}`) : null,
+      h("button", { type: "button", onclick: () => {
+        clear(descriptionBlock).append(editorForm(t, {
+          isColumn: false,
+          onSave: (changes) => saveDictionaryEntry(t.name, null, t, changes),
+          onCancel: showDescription,
+        }));
+      } }, "Edit table description"));
+  };
+  showDescription();
+
+  const rows = [];
+  for (const c of t.columns) {
+    const row = h("tr", {},
+      h("th", { scope: "row" }, c.name, c.primary_key ? h("span", { className: "muted small" }, " PK") : null,
+        h("div", { className: "muted small" }, c.type || "")),
+      h("td", {},
+        c.description || h("span", { className: "muted" }, "—"),
+        c.description_source && c.description_source !== "sme" ? h("div", { className: "muted small" }, `from ${c.description_source}`) : null,
+        Object.keys(c.values || {}).length ? h("ul", { className: "values small" }, Object.entries(c.values).map(([k, v]) => h("li", {}, h("code", {}, k), ` ${v}`))) : null,
+        c.notes ? h("div", { className: "small" }, h("strong", {}, "Notes: "), c.notes) : null,
+        suggestionList(c.suggestions)),
+      h("td", {}, c.roles.length ? c.roles.map((r) => h("div", {}, roleChip(r),
+        r.references ? h("div", { className: "muted small" }, `→ ${r.references} · ${(r.row_coverage * 100).toFixed(1)}% rows match · ${r.unmatched_keys} unmatched`) : null))
+        : h("span", { className: "muted small" }, "—")),
+      h("td", {}, profileCell(c.profile)),
+      h("td", {}, statusPill(c.status, c.description_source)),
+      h("td", {}, h("button", { type: "button", "aria-label": `Edit ${c.name}`, onclick: () => {
+        const editRow = h("tr", { className: "edit-row" }, h("td", { colspan: 6 }, editorForm(c, {
+          isColumn: true,
+          onSave: (changes) => saveDictionaryEntry(t.name, c.name, c, changes),
+          onCancel: () => editRow.remove(),
+        })));
+        document.querySelectorAll("#dict-detail .edit-row").forEach((r) => r.remove());
+        row.after(editRow);
+      } }, "Edit")));
+    rows.push(row);
+  }
+
+  appendAll(panel,
+    h("h2", {}, t.name, " ", statusPill(t.status, t.description_source)),
+    h("p", { className: "small muted" }, [
+      t.row_count != null ? `${t.row_count} rows` : null, t.type, t.schema_fingerprint ? `schema ${t.schema_fingerprint}` : null,
+      t.in_inventory ? null : "not in the latest inventory",
+    ].filter(Boolean).join(" · ")),
+    descriptionBlock,
+    t.roles.length ? [h("h3", {}, "Graph roles"), h("div", { className: "chips" }, t.roles.map(roleChip))] : null,
+    t.suggestions.length ? [h("h3", {}, "Pending suggestions"), suggestionList(t.suggestions)] : null,
+    t.history.length ? [h("h3", {}, "Rejected interpretations"), h("ul", { className: "small" }, t.history.map((x) =>
+      h("li", {}, x.hypothesis, x.sme_notes.length ? h("span", { className: "muted" }, ` (SME: ${x.sme_notes.join("; ")})`) : null)))] : null,
+    h("h3", {}, `Columns (${t.coverage.described}/${t.coverage.columns} described, ${t.coverage.profiled} profiled)`),
+    h("div", { className: "table-wrap dict-columns" }, h("table", {},
+      h("thead", {}, h("tr", {}, ["Column", "What we know", "Graph role", "Profile", "Status", ""].map((x) => h("th", {}, x)))),
+      h("tbody", {}, rows))));
+}
+
+async function profileDictionary() {
+  const source = $("#dict-source").value;
+  try {
+    const run = await wsApi("/runs", { method: "POST", body: JSON.stringify({ source, planner: "profile", limits: { max_iterations: 99 } }) });
+    toast(`Profiling started (${run.id}). The dictionary refreshes when it finishes.`);
+    const button = $("#dict-profile-btn");
+    button.disabled = true;
+    const poll = async () => {
+      const r = await wsApi(`/runs/${encodeURIComponent(run.id)}?events=0`).catch(() => null);
+      if (r && ["queued", "running", "stopping"].includes(r.status)) {
+        $("#dict-summary").textContent = `Profiling… ${r.iterations?.at(-1)?.summary || "starting"}`;
+        setTimeout(poll, 2000);
+        return;
+      }
+      button.disabled = false;
+      if (r) toast(`Profiling ${r.status}${r.termination_reason ? ` (${r.termination_reason})` : ""}`, r.status === "failed");
+      if (state.ws && currentTab() === "dictionary") loadDictionary();
+    };
+    setTimeout(poll, 1500);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function exportDictionary() {
+  const source = $("#dict-source").value;
+  try {
+    const headers = {};
+    const token = localStorage.getItem("ddg-token");
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const response = await fetch(`/api/w/${encodeURIComponent(state.ws)}/dictionary/${encodeURIComponent(source)}/markdown`, { headers });
+    if (!response.ok) throw new Error(await response.text());
+    const url = URL.createObjectURL(await response.blob());
+    const link = h("a", { href: url, download: `${state.ws}-${source}-dictionary.md` });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) { toast(`Export failed: ${e.message}`, true); }
+}
+
+// ---------- reset discovery ----------
+async function openResetDialog() {
+  const dialog = $("#reset-dialog");
+  $("#reset-form").reset();
+  $("#reset-error").textContent = "";
+  $("#reset-confirm").placeholder = state.ws;
+  try {
+    const preview = await wsApi("/reset");
+    document.querySelectorAll("#reset-dialog [data-count]").forEach((el) => {
+      const n = preview.counts[el.dataset.count];
+      el.textContent = `(${n} item${n === 1 ? "" : "s"})`;
+    });
+  } catch (e) { $("#reset-error").textContent = e.message; }
+  dialog.showModal();
+}
+
+async function submitReset(event) {
+  event.preventDefault();
+  const scopes = [...document.querySelectorAll("#reset-form input[name=scope]:checked")].map((el) => el.value);
+  if (!scopes.length) { $("#reset-error").textContent = "Select at least one item to archive."; return; }
+  const actor = ($("#reviewer").value || localStorage.getItem("ddg-reviewer") || "").trim() || "ui";
+  try {
+    const result = await wsApi("/reset", { method: "POST", body: JSON.stringify({ scopes, actor, confirm: $("#reset-confirm").value.trim() }) });
+    $("#reset-dialog").close();
+    const moved = Object.entries(result.moved || {}).map(([k, v]) => `${v} ${k}`).join(", ");
+    toast(moved ? `Archived ${moved}. The next run starts fresh.` : "Nothing to archive.");
+    state.selectedRun = null;
+    $("#run-detail").classList.add("hidden");
+    loadRuns();
+    refreshBadge();
+  } catch (e) {
+    $("#reset-error").textContent = e.message;
+  }
+}
+
 // ---------- boot ----------
 document.addEventListener("DOMContentLoaded", async () => {
   document.querySelectorAll("[role=tab]").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
@@ -557,6 +995,15 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#graph-type").addEventListener("change", graphSearch);
   $("#graph-clear-btn").addEventListener("click", () => { state.cy?.elements().remove(); renderTextView(); });
   $("#meta-source").addEventListener("change", loadMetadata);
+  $("#review-tier").addEventListener("change", loadCandidates);
+  $("#reset-btn").addEventListener("click", openResetDialog);
+  $("#reset-form").addEventListener("submit", submitReset);
+  $("#reset-cancel").addEventListener("click", () => $("#reset-dialog").close());
+  $("#dict-source").addEventListener("change", () => { state.dictTable = null; loadDictionary(); });
+  $("#dict-filter").addEventListener("input", renderDictionaryList);
+  $("#dict-show").addEventListener("change", renderDictionaryList);
+  $("#dict-profile-btn").addEventListener("click", profileDictionary);
+  $("#dict-export-btn").addEventListener("click", exportDictionary);
   $("#workspace-select").addEventListener("change", (e) => switchWorkspace(e.target.value).catch((err) => toast(err.message, true)));
   $("#new-workspace-btn").addEventListener("click", openNewWorkspaceDialog);
   $("#new-ws-form").addEventListener("submit", createWorkspace);

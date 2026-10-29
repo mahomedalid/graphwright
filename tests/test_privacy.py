@@ -46,3 +46,23 @@ def test_events_do_not_contain_row_values(tools, store):
     tools.sample_rows("prod_catalog", ["prod_name"], limit=3)
     events = store.read_events("run-test")
     assert events and "Product" not in str(events)
+
+
+def test_given_unexpected_tool_error_when_recording_then_failure_is_visible_without_raw_error_text(
+    tools, store, monkeypatch
+):
+    def broken():
+        raise RuntimeError("sensitive row value")
+
+    monkeypatch.setattr(tools.adapter, "tables", broken)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="sensitive"):
+        tools.list_tables()
+    events = store.read_events("run-test")
+
+    assert [event["type"] for event in events] == ["tool_started", "tool_failed"]
+    assert events[-1]["error_type"] == "RuntimeError"
+    assert events[0]["call_id"] == events[1]["call_id"]
+    assert "sensitive" not in str(events)

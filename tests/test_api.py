@@ -22,6 +22,21 @@ def _wait(client, run_id, timeout=60):
     raise AssertionError("run did not finish")
 
 
+def test_given_damaged_event_log_when_getting_run_then_returns_valid_events(client, store):
+    run_id = "run-damaged"
+    store.save_run({"id": run_id, "status": "failed"})
+    store.append_event(run_id, {"type": "run_started"})
+    path = store.run_dir(run_id) / "events.jsonl"
+    with path.open("ab") as handle:
+        handle.write(b"broken\n\xff\n")
+    store.append_event(run_id, {"type": "run_finished"})
+
+    response = client.get(f"/api/w/retail/runs/{run_id}?events=150")
+
+    assert response.status_code == 200
+    assert [event["type"] for event in response.json()["events"]] == ["run_started", "run_finished"]
+
+
 def test_full_review_codegen_and_graph_flow(client, settings):
     assert client.get("/").status_code == 200
     status = client.get("/api/status").json()
@@ -83,6 +98,37 @@ def test_unknown_source_and_codegen_errors(client):
     assert client.post("/api/w/retail/runs", json={"source": "nope"}).status_code == 400
     blocked = client.post("/api/w/retail/codegen", json={"source": "retail"})
     assert blocked.status_code == 422 and blocked.json()["errors"]
+
+
+@pytest.mark.parametrize("iterations", [0, 100, 1.5, True])
+def test_given_invalid_iteration_limit_when_starting_then_request_is_rejected(client, iterations):
+    payload = {"source": "retail", "limits": {"max_iterations": iterations}}
+
+    response = client.post("/api/w/retail/runs", json=payload)
+
+    assert response.status_code == 400
+    assert "between 1 and 99" in response.json()["detail"]
+
+
+def test_given_invalid_iteration_limit_when_resuming_then_request_is_rejected(client):
+    created = client.post("/api/w/retail/runs", json={"source": "retail", "planner": "heuristic"})
+    run_id = created.json()["id"]
+    _wait(client, run_id)
+
+    response = client.post(f"/api/w/retail/runs/{run_id}/resume", json={"limits": {"max_iterations": 100}})
+
+    assert response.status_code == 409
+    assert "between 1 and 99" in response.json()["detail"]
+
+
+def test_given_maximum_iteration_limit_when_starting_then_99_is_accepted(client):
+    response = client.post("/api/w/retail/runs", json={
+        "source": "retail", "planner": "heuristic", "limits": {"max_iterations": 99},
+    })
+
+    assert response.status_code == 201
+    assert response.json()["limits"]["max_iterations"] == 99
+    _wait(client, response.json()["id"])
 
 
 def test_api_token_is_enforced(project, monkeypatch):

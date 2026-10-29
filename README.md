@@ -65,6 +65,17 @@ allowlist = ["products.*", "*.category"]
 
 Edit `workspaces/mydata/context/topology.md`:
 
+With Foundry configured, you can write an open-format description instead of using
+the headings below. For example:
+
+```text
+Customers place orders. A customer is identified by customer number and has a name.
+An order is identified by order number and has an order date.
+Each order belongs to one customer; a customer can place many orders.
+```
+
+For offline use without Foundry, use the structured format:
+
 ```markdown
 ## Node Types
 
@@ -96,6 +107,24 @@ Check it:
 uv run ddg topology
 ```
 
+For free-form input, this command calls Foundry to extract a structured topology,
+then validates it. An auto/Foundry discovery run also does this at startup, within
+its model-call, token-cost, time, and cancellation budgets. Structured input that
+already validates does not need an extraction call. Authentication or permission
+errors are reported; configuring Foundry does not guarantee access.
+
+The original document is never overwritten. Validated interpretations are cached in
+`metadata/topology.json` and reused by the UI, discovery, fact revalidation, and code
+generation. Editing the source invalidates the cache. Review the extracted node and
+edge types in **Topology & Metadata**, because LLM interpretation can be incorrect.
+Additional reference documents cannot define or override the topology.
+
+Opening the UI or listing workspaces never calls the model. Until extraction runs,
+the UI shows **awaiting Foundry parsing**. Without Foundry or a current cached
+interpretation, invalid structured input reports both remedies: configure Foundry
+or use the structured format. An explicitly selected heuristic run does not call
+Foundry, but it can reuse an existing validated interpretation.
+
 Put additional Markdown references, such as data dictionaries or previous findings, in
 `workspaces/mydata/context/`. All `.md` files are read recursively, including subfolders;
 other file types are ignored. Only the configured topology file defines graph types.
@@ -108,7 +137,7 @@ The run record lists additional documents in `context_files`. Files must be UTF-
 unreadable files fail the run rather than being silently omitted.
 
 > [!WARNING]
-> Reference documents are sent to the configured model without the source-column
+> Free-form topology and reference documents are sent to the configured model without the source-column
 > sampling filter. Include only content you are authorized to share with that model.
 > All reference text is included without truncation, so keep documents concise to
 > control token costs and avoid model context-limit errors.
@@ -135,12 +164,101 @@ FOUNDRY_MODEL=<deployment-name>
 uv run ddg serve
 ```
 
+Runs default to 3 iterations, with an allowed range of 1 through 99. Override
+`[run].max_iterations` in your configuration, use `--max-iterations` in the CLI,
+or enter a limit in the UI. A short run can finish before mapping every graph type;
+resume it or raise the limit when more discovery is needed.
+
+The Runs UI refreshes every 5 seconds while runs are active. Refresh requests run
+sequentially, and transient refresh failures are shown and retried. The Events panel
+shows startup stages, topology parsing, model request start/completion/failure,
+tool start/completion/failure with durations, and iteration/run outcomes. Model
+events contain operational metadata and usage, not prompts or model responses.
+Model waits are bounded by the remaining run time budget.
+
 In the UI, with **mydata** selected:
 
 1. **Runs**: select **Start run**.
 2. **Review**: approve or reject each candidate, with notes.
 3. **Facts & Code**: select **Generate graph builder code**, then run the command it shows.
-4. **Graph**: search and explore.
+4. **Dictionary**: select **Profile columns**, then document tables and columns (see [Data Dictionary](#data-dictionary)).
+5. **Graph**: search and explore.
+
+## Data Dictionary
+
+The **Dictionary** tab shows everything known about each table and column in one place, and you can start using it before writing a topology.
+
+| What you see                          | Where it comes from                                                                              |
+|---------------------------------------|--------------------------------------------------------------------------------------------------|
+| Tables, columns, types, row counts    | Source inventory collected by any run                                                           |
+| Null %, distinct counts, value shapes | **Profile columns** (a `profile` run); top values only for allowlisted columns                  |
+| Graph roles                           | Approved facts and pending candidates (node keys, properties, edge keys with join coverage)     |
+| Descriptions and code meanings        | SME edits in the tab, approved `annotation` facts proposed by the agent, or source comments     |
+| Rejected interpretations              | Rejected candidates and their SME notes, so nobody repeats them                                 |
+
+Description precedence is SME edit, then approved annotation fact, then source comment; the tab shows where each came from. Each entry has a status (`provisional`, `verified`, `deprecated`), notes for assumptions and open questions, and a revision so concurrent edits are detected.
+
+The Foundry agent reads the dictionary (`get_dictionary` tool) and can propose `annotation` candidates, such as code meanings or business rules, backed by evidence. They appear in **Review** and as suggestions in the Dictionary until an SME approves them.
+
+```powershell
+uv run ddg run --planner profile --max-iterations 50   # collect column statistics only
+uv run ddg dictionary                                  # export Markdown + JSON to dictionary/exports/
+```
+
+**Export Markdown** in the tab downloads the same document.
+
+## Confidence, Modes, and Resetting Discovery
+
+### Confidence tiers
+
+Every candidate is labeled **high**, **medium**, or **low** confidence, with the reasons shown in **Review**. The tier is computed from the cited evidence; the agent can lower it but never raise it.
+
+| Kind         | High                                                | Medium                                                | Low                                           |
+|--------------|-----------------------------------------------------|-------------------------------------------------------|-----------------------------------------------|
+| Node mapping | Key unique and non-null on full data                | Unique in a sample, or under 1% duplicate keys        | Key not unique, or never checked              |
+| Edge mapping | 90% or more of rows match the referenced key (full) | 50% or more match, or high overlap only in a sample   | Low or no overlap; at best compatible formats |
+| Annotation   | (not used)                                          | Backed by a profile or sample of the annotated column | No profile or sample of the column cited      |
+
+An edge whose observed cardinality conflicts with the topology drops one tier. **Review** sorts by tier and has a tier filter; `ddg candidates --tier high` does the same.
+
+### Conservative and exploratory modes
+
+| Mode                     | Behavior                                                                                                                        |
+|--------------------------|---------------------------------------------------------------------------------------------------------------------------------|
+| `conservative` (default) | Low-confidence proposals are refused; the agent records them as notes instead                                                   |
+| `exploratory`            | Low-confidence hypotheses are accepted and labeled, so the agent proposes its best guess for every uncovered node and edge type |
+
+Pick the mode per run in the UI or with `ddg run --mode exploratory`, or set a workspace default:
+
+```toml
+[agent]
+mode = "exploratory"
+```
+
+### Independently sampled data
+
+When every table is sampled separately (for example `LIMIT 4000` per table), true foreign keys rarely overlap, so join checks cannot confirm relationships. Mark the source so the agent stops treating zero overlap as disproof and relies on the `check_compatibility` tool (types, value shapes after transforms, and naming) instead:
+
+```toml
+[sources.v2]
+type = "sqlite"
+path = "data/household-samples-v2.sqlite"
+independent_samples = true
+```
+
+Relationships found this way are at most **low** confidence. To get high-confidence relationships, extract samples that keep keys consistent, for example sample a set of accounts first and then pull related rows by those keys.
+
+### Reset discovery
+
+**Reset discovery…** on the **Runs** tab (or `ddg reset`) archives discovery state to `archive/reset-<timestamp>/` so the next run starts fresh. Nothing is deleted, and topology, context documents, dictionary annotations, and configuration are never touched.
+
+```powershell
+uv run ddg reset --fresh                 # runs, pending candidates, inventories (keeps approved and rejected)
+uv run ddg reset --rejected --yes        # lets the agent propose previously rejected ideas again
+uv run ddg reset --approved              # archives approved facts too (they need re-approval)
+```
+
+Archiving runs also clears column profiles in the Dictionary. Active runs must be cancelled first.
 
 ## Overview
 
@@ -377,18 +495,21 @@ Validation runs before every discovery run. Undefined edge endpoints, duplicate 
 
 All paths are relative to `workspaces/<name>/`.
 
-| Location                   | Contents                                                                            |
-|----------------------------|-------------------------------------------------------------------------------------|
-| `topology.md`              | User-authored topology                                                              |
-| `workspace.toml`           | Sources, sampling allowlist, and overrides of `ddg.toml`                            |
-| `facts/fact-*.json`        | SME-approved facts with mapping, evidence, reviewer, notes, and versions            |
-| `candidates/cand-*.json`   | Candidates with evidence, limitations, and decision history                         |
-| `metadata/<source>/`       | Source inventory with schema fingerprints                                           |
-| `runs/<run-id>/`           | Run record, checkpoint, evidence files, and correlated events (no raw row contents) |
-| `sandbox/generated/`       | Generated builders and manifests                                                    |
-| `graph_output/`            | Builder output (`ddg-graph/v1` JSON, optional GraphML) loaded by the visualizer     |
+| Location                      | Contents                                                                            |
+|-------------------------------|-------------------------------------------------------------------------------------|
+| `topology.md`                 | User-authored topology                                                              |
+| `workspace.toml`              | Sources, sampling allowlist, and overrides of `ddg.toml`                            |
+| `facts/fact-*.json`           | SME-approved facts with mapping, evidence, reviewer, notes, and versions            |
+| `candidates/cand-*.json`      | Candidates with evidence, limitations, and decision history                         |
+| `metadata/<source>/`          | Source inventory with schema fingerprints                                           |
+| `runs/<run-id>/`              | Run record, checkpoint, evidence files, and correlated events (no raw row contents) |
+| `sandbox/generated/`          | Generated builders and manifests                                                    |
+| `graph_output/`               | Builder output (`ddg-graph/v1` JSON, optional GraphML) loaded by the visualizer     |
+| `dictionary/annotations.json` | SME-curated table and column descriptions, code meanings, notes, and status         |
+| `dictionary/history.jsonl`    | Audit log of dictionary edits (who, when, what)                                     |
+| `dictionary/exports/`         | Generated Markdown and JSON dictionary exports                                      |
 
-Runtime folders and local SQLite files are ignored by Git; `workspace.toml`, `topology.md`, and fixtures are tracked.
+Runtime folders, dictionary exports, and local SQLite files are ignored by Git; `workspace.toml`, `topology.md`, dictionary annotations and history, and fixtures are tracked.
 
 ## Graph Output Contract
 
