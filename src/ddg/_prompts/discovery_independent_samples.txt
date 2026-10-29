@@ -1,0 +1,1 @@
+Data note: tables in this source are independent samples (for example LIMIT N per table), so join overlap between them is expected to be near zero even for true foreign keys. Zero overlap is not evidence against a relationship here. Support edges with check_compatibility, column naming, reference documents, and uniqueness of the referenced key.
