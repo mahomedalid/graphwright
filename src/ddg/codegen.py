@@ -130,8 +130,13 @@ def build_graph(conn, dialect="sqlite"):
                     raise ValueError("Null key in %s for %s" % (m["source_table"], m["node_type"]))
                 stats["skipped_null_keys"] += 1
                 continue
-            node_id = "%s:%s" % (m["node_type"], key)
-            node = nodes.setdefault(node_id, {"id": node_id, "type": m["node_type"], "key": key, "properties": {}, "provenance": []})
+            node_id = graph_node_id(
+                m["node_type"], m["identity_namespace"], [row[c] for c in m["key_columns"]], m["key_transforms"],
+            )
+            node = nodes.setdefault(node_id, {
+                "id": node_id, "type": m["node_type"], "key": key,
+                "properties": {}, "provenance": [],
+            })
             for prop, col in m["properties"].items():
                 if node["properties"].get(prop) is None and row[col] is not None:
                     node["properties"][prop] = _json_value(row[col])
@@ -148,8 +153,14 @@ def build_graph(conn, dialect="sqlite"):
                     raise ValueError("Null edge key in %s for %s" % (m["source_table"], m["edge_type"]))
                 stats["skipped_null_keys"] += 1
                 continue
-            source_id = "%s:%s" % (m["from_node_type"], from_key)
-            target_id = "%s:%s" % (m["to_node_type"], to_key)
+            source_id = graph_node_id(
+                m["from_node_type"], m["from_identity_namespace"],
+                [row[c] for c in m["from_key_columns"]], m["from_key_transforms"],
+            )
+            target_id = graph_node_id(
+                m["to_node_type"], m["to_identity_namespace"],
+                [row[c] for c in m["to_key_columns"]], m["to_key_transforms"],
+            )
             if source_id not in nodes or target_id not in nodes:
                 stats["dangling_edges"] += 1
                 continue
@@ -286,6 +297,13 @@ def render(spec: BuildSpec, source_cfg_options: dict, filename: str, generated_a
             "generator": f"ddg {__version__}",
             "generated_at": generated_at,
             "builder": filename,
+            "identity_format": "semantic/v1",
+            "identity_contracts": {
+                node["mapping_id"]: {
+                    "node_type": node["node_type"], "identity_namespace": node["identity_namespace"],
+                    "identity_key_parts": node["identity_key_parts"], "key_transforms": node["key_transforms"],
+                } for node in spec.nodes
+            },
         },
         "warnings": spec.warnings,
         "nodes": spec.nodes,

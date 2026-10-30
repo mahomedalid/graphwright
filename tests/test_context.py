@@ -90,6 +90,34 @@ def test_given_references_when_running_then_planner_receives_snapshot(settings, 
         {"path": "context/notes.md", "content": "Customer means buyer."}
     ]
     assert store.get_run(result["id"])["context_files"] == ["context/notes.md"]
+    event = next(event for event in store.read_events(result["id"]) if event["type"] == "context_loaded")
+    assert event["file_count"] == 1
+    assert event["files"] == ["context/notes.md"]
+    assert "Customer means buyer." not in str(event)
+
+
+@pytest.mark.parametrize("with_references", [False, True])
+def test_given_context_when_resuming_then_event_lists_current_files(settings, store, with_references):
+    runner = DiscoveryRunner(settings, store)
+    original = runner.execute(runner.create_run("retail", "heuristic", {"max_iterations": 1})["id"])
+    if with_references:
+        directory = settings.workspace_dir / "context"
+        (directory / "prior").mkdir(parents=True)
+        (directory / "uroj.md").write_text("Domain reference", encoding="utf-8")
+        (directory / "prior" / "notes.MD").write_text("Prior findings", encoding="utf-8")
+        (directory / "ignored.txt").write_text("Not loaded", encoding="utf-8")
+
+    resumed = runner.execute(runner.create_run(
+        "retail", "heuristic", {"max_iterations": 2}, resume_from=original["id"],
+    )["id"])
+
+    expected = ["context/prior/notes.MD", "context/uroj.md"] if with_references else []
+    assert resumed["status"] == "completed"
+    assert original["context_files"] == []
+    assert resumed["context_files"] == expected
+    event = next(event for event in store.read_events(resumed["id"]) if event["type"] == "context_loaded")
+    assert event["files"] == expected
+    assert event["file_count"] == len(expected)
 
 
 def test_given_invalid_reference_when_running_then_run_fails(settings, store):
@@ -102,3 +130,4 @@ def test_given_invalid_reference_when_running_then_run_fails(settings, store):
 
     assert result["status"] == "failed"
     assert "UnicodeDecodeError" in result["error"]
+    assert not any(event["type"] == "context_loaded" for event in store.read_events(result["id"]))

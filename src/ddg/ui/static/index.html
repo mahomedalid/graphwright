@@ -89,6 +89,13 @@
               <option value="profile">Profile columns only (data dictionary)</option>
             </select>
           </label>
+          <label>Discovery target
+            <select name="discovery_scope" id="run-discovery-scope">
+              <option value="all">Nodes and relationships</option>
+              <option value="edges">Relationships only (reuse existing node mappings)</option>
+            </select>
+          </label>
+          <p class="muted small">Relationships-only runs never propose nodes or dictionary annotations. Approved node mappings are preferred; pending endpoint mappings are flagged for review.</p>
           <label>Mode
             <select name="mode" id="run-mode">
               <option value="">Workspace default</option>
@@ -96,6 +103,8 @@
               <option value="exploratory">Exploratory: also propose low-confidence hypotheses</option>
             </select>
           </label>
+          <label class="inline"><input type="checkbox" name="validate_topology" id="run-validate-topology"> Validate topology against the data</label>
+          <p class="muted small">Test topology assumptions and recommend edits in the run details. Recommendations never modify topology or approve facts. Not available with the profile-only planner.</p>
           <div class="row">
             <label>Max minutes <input name="max_minutes" type="number" min="0.1" step="0.1"></label>
             <label>Max iterations <input name="max_iterations" type="number" min="1" max="99" step="1" placeholder="3"></label>
@@ -150,13 +159,22 @@
     <section id="tab-facts" role="tabpanel" class="tab hidden">
       <div class="toolbar">
         <label>Source <select id="facts-source"></select></label>
+        <label>Export target <select id="codegen-target">
+          <option value="standalone">Standalone Python builder</option>
+          <option value="databricks-notebooks">Databricks notebook package (ZIP)</option>
+        </select></label>
         <label class="inline"><input type="checkbox" id="allow-stale"> Bypass old-approval warnings (does not fix invalid mappings)</label>
         <button id="generate-btn" class="primary">Generate graph builder code</button>
+      </div>
+      <div id="notebook-options" class="card hidden">
+        <label for="table-bindings">Databricks table binding overrides (optional JSON object)</label>
+        <textarea id="table-bindings" rows="4" placeholder='{"sample_table": "catalog.schema.table"}'></textarea>
+        <p class="small muted">Omit overrides to use local sample-manifest bindings. Review the resolved bindings in the generated package. Missing, ambiguous, or invalid bindings block export; enter explicit fully qualified table names and retry. Notebook export requires current approvals and never connects to or executes Databricks.</p>
       </div>
       <div class="grid two">
         <div class="card">
           <h2>Approved facts</h2>
-          <p class="small">Choose which mappings to include. Uncheck an unresolved mapping to leave it out of this build without deleting its approval. If you leave out a node mapping, its relationships may also need to be left out.</p>
+          <p class="small">Choose which mappings to include. Uncheck an unresolved mapping to leave it out of this build without deleting its approval. For facts that cannot be corrected or revalidated, use Delete fact and confirm its ID. Deleting a node fact can leave its relationships without an endpoint.</p>
           <p id="facts-selection-status" class="small muted" role="status"></p>
           <button id="facts-recheck-btn">Recheck mappings</button>
           <div id="revalidation"></div>
@@ -167,7 +185,7 @@
         </div>
         <div class="card">
           <h2>Generated code</h2>
-          <p class="muted small">The product never runs generated code. Review it, then choose a command for JSON, SQLite, or Neo4j Cypher. JSON and SQLite outputs appear in the Graph tab; import Cypher into Neo4j separately.</p>
+          <p class="muted small">The product never runs generated code. For standalone builders, review and choose JSON, SQLite, or Neo4j Cypher. JSON and SQLite outputs appear in the Graph tab. For notebook packages, download and extract the ZIP, then import the four Python source notebooks into the same Databricks folder. Review configuration and bindings, then execute manually.</p>
           <div id="codegen-result"></div>
           <h3>Previous builders</h3>
           <ul id="generated-list" class="plain"></ul>
@@ -188,6 +206,23 @@
         <div class="row">
           <button type="submit" class="primary">Validate and confirm approval</button>
           <button type="button" id="fact-revalidation-cancel">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="fact-deletion-dialog" aria-labelledby="fact-deletion-title">
+      <form id="fact-deletion-form">
+        <h2 id="fact-deletion-title">Delete an approved fact</h2>
+        <p class="warn">Use this for a fact that cannot be corrected or revalidated. It will be removed from active knowledge and future builders, and its candidate approval will be revoked. Audit history is retained. Dependent facts are not deleted.</p>
+        <p>Previously generated builders and graph snapshots are unchanged. Generate and review a new builder after deletion.</p>
+        <div id="fact-deletion-preview"></div>
+        <label>Reviewer <input id="fact-deletion-reviewer" maxlength="200" required></label>
+        <label>Why must this fact be deleted? <textarea id="fact-deletion-notes" maxlength="5000" required></textarea></label>
+        <label>Type the fact ID to confirm <input id="fact-deletion-confirm" autocomplete="off" required></label>
+        <p id="fact-deletion-error" class="error" role="alert"></p>
+        <div class="row">
+          <button type="submit" class="reject">Delete fact</button>
+          <button type="button" id="fact-deletion-cancel">Cancel</button>
         </div>
       </form>
     </dialog>

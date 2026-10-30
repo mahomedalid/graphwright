@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 
 from ..tools import DiscoveryTools
+from ..mappings import available_node_mappings
 from ..topology import EdgeType, NodeType
 from .base import IterationContext, IterationResult
 
@@ -78,6 +79,14 @@ class HeuristicPlanner:
     def run_iteration(self, ctx: IterationContext, tools: DiscoveryTools) -> IterationResult:
         memory = dict(ctx.memory)
         memory.setdefault("exhausted", [])
+        node_maps = available_node_mappings(ctx.snapshot, ctx.source)
+        if tools.discovery_scope == "edges" and not any(
+            edge.from_type in node_maps and edge.to_type in node_maps for edge in ctx.topology.edge_types.values()
+        ):
+            return IterationResult(
+                "Edges-only discovery has no relationships with existing endpoint mappings. "
+                "Run full discovery or review node mappings first.", memory, done=True,
+            )
 
         listing = tools.list_tables()
         all_tables = [t["table"] for t in listing.get("tables", [])]
@@ -89,33 +98,123 @@ class HeuristicPlanner:
             return IterationResult(f"Inventoried {len(batch)} of {len(all_tables)} tables.", memory)
 
         covered = _covered_elements(ctx)
+        if tools.validate_topology:
+            memory.setdefault("validation_visited", [])
         for node in ctx.topology.node_types.values():
+            if tools.discovery_scope == "edges":
+                continue
             element = f"node:{node.name}"
-            if node.name in covered["nodes"] or element in memory["exhausted"]:
+            if tools.validate_topology:
+                if element in memory["validation_visited"]:
+                    continue
+            elif node.name in covered["nodes"] or element in memory["exhausted"]:
                 continue
             summary = self._discover_node(node, tools, ctx)
+            if tools.validate_topology:
+                memory["validation_visited"].append(element)
             if summary is None:
                 memory["exhausted"].append(element)
                 summary = f"No acceptable table found for node type {node.name}."
+                if tools.validate_topology and not any(f["element"] == element for f in tools.topology_findings):
+                    self._unresolved(element, tools, "No suitable source table or key was identified.")
             return IterationResult(summary, memory)
 
-        node_maps = _node_mappings(ctx)
         for edge in ctx.topology.edge_types.values():
             element = f"edge:{edge.name}"
-            if edge.name in covered["edges"] or element in memory["exhausted"]:
+            if tools.validate_topology:
+                if element in memory["validation_visited"]:
+                    continue
+            elif edge.name in covered["edges"] or element in memory["exhausted"]:
                 continue
             if edge.from_type not in node_maps or edge.to_type not in node_maps:
+                if tools.validate_topology:
+                    self._unresolved(element, tools, "Endpoint mappings are unavailable; relationship not tested.")
+                    memory["validation_visited"].append(element)
                 continue
             summary = self._discover_edge(edge, node_maps, tools, ctx)
+            if tools.validate_topology:
+                memory["validation_visited"].append(element)
+                if not any(f["element"] == element for f in tools.topology_findings):
+                    self._unresolved(element, tools, "No sufficiently supported join was identified.")
             if summary is None:
                 memory["exhausted"].append(element)
                 summary = f"No acceptable source found for edge type {edge.name}."
             return IterationResult(summary, memory)
 
-        return IterationResult("No remaining topology elements to investigate.", memory, done=True)
+        summary = "No remaining topology elements to investigate."
+        if tools.discovery_scope == "edges" and memory.get("blocked_edges"):
+            summary = "Relationship discovery finished for available endpoints. Missing node mappings block: " + ", ".join(
+                f"{edge} ({', '.join(nodes)})" for edge, nodes in memory["blocked_edges"].items()
+            )
+        return IterationResult(summary, memory, done=True)
+
+    def _unresolved(self, element: str, tools: DiscoveryTools, finding: str) -> None:
+        evidence_ids = [info["evidence_id"] for info in tools.inventory.values() if info.get("evidence_id")]
+        if evidence_ids:
+            tools.record_topology_finding(
+                element, "coverage", "inconclusive", finding,
+                "Review source scope, synonyms, and endpoint mappings before changing or removing this topology element.",
+                evidence_ids, ["Offline discovery uses naming heuristics, not semantic proof."],
+            )
+
+    def _validate_node(self, node: NodeType, table: str, tools: DiscoveryTools, *, tentative: bool = False) -> None:
+        info = tools.inventory[table]
+        element = f"node:{node.name}"
+        caveats = ["Source table and column associations are inferred from names; confirm business meaning with an SME."]
+        if tentative:
+            caveats.append("No acceptable node mapping was established; this table is only a naming-based hypothesis.")
+        properties = _match_properties(node.properties, info["columns"], exclude=set())
+        missing = [prop for prop in node.properties if prop not in properties]
+        tools.record_topology_finding(
+            element, "properties", "inconclusive" if missing else "supported",
+            f"Compared properties against '{table}'. "
+            + (f"No column matched: {', '.join(missing)}." if missing else "All declared properties have plausible columns."),
+            "Clarify property names or synonyms, find another source, or consider removing unavailable properties."
+            if missing else "",
+            [info["evidence_id"]], caveats,
+        )
+        if not node.key:
+            tools.record_topology_finding(
+                element, "key", "inconclusive", "The topology does not specify a key.",
+                "Document an entity key after checking uniqueness, nulls, and business identity.",
+                [info["evidence_id"]], caveats,
+            )
+            return
+        score, column = max(
+            ((phrase_sim(node.key, col["name"]), col["name"]) for col in info["columns"]),
+            default=(0.0, ""),
+        )
+        if score < MIN_PROPERTY_SIM:
+            tools.record_topology_finding(
+                element, "key", "inconclusive", f"No column confidently matched declared key '{node.key}' in '{table}'.",
+                "Clarify the key's source columns or specify a composite key; do not replace it from naming alone.",
+                [info["evidence_id"]], caveats,
+            )
+            return
+        check = tools.check_uniqueness(table, [column])
+        if check.get("error"):
+            self._unresolved(element, tools, f"Key check failed: {check['error']}")
+            return
+        empty = check["distinct_keys"] == 0
+        status = "inconclusive" if tentative or empty or check["scope"] != "full" else "supported" if check["unique"] else "mismatch"
+        tools.record_topology_finding(
+            element, "key", status,
+            f"Possible declared key '{node.key}' maps to '{table}.{column}': "
+            f"{check['duplicate_keys']} duplicate keys, {check['rows_with_null_key']} null rows, "
+            f"{check['distinct_keys']} distinct non-null keys.",
+            "" if status == "supported" else
+            "Review the entity grain and key: test a composite or alternative key, document normalization, "
+            "or address source-quality issues before revising the topology.",
+            [info["evidence_id"], check["evidence_id"]], caveats,
+        )
 
     # ----- nodes -------------------------------------------------------------
     def _discover_node(self, node: NodeType, tools: DiscoveryTools, ctx: IterationContext) -> str | None:
+        if tools.validate_topology:
+            existing = available_node_mappings(ctx.snapshot, ctx.source).get(node.name)
+            if existing and existing["source_table"] in tools.inventory:
+                self._validate_node(node, existing["source_table"], tools)
+                return f"Validated assumptions for {node.name} using its existing mapping to {existing['source_table']}."
         concepts = concept_tokens(node)
         scored = []
         for table, info in tools.inventory.items():
@@ -146,12 +245,18 @@ class HeuristicPlanner:
                     "source_table": table,
                     "key_columns": [column["name"]],
                     "key_transforms": [chain],
+                    "identity_namespace": f"{ctx.source}.{table}.{column['name']}",
+                    "identity_key_parts": [column["name"]],
                     "properties": properties,
                     "null_key_policy": "skip",
                 }
                 confidence = round(min(0.95, 0.6 * table_score + 0.3 + 0.05 * bool(column.get("primary_key"))), 2)
                 unmatched = [p for p in node.properties if p not in properties]
                 limitations = [f"No column matched topology properties: {', '.join(unmatched)}"] if unmatched else []
+                limitations.append(
+                    "Identity namespace is conservatively source-record scoped by the offline planner; "
+                    "review a semantic namespace before sharing identity across tables or systems."
+                )
                 if set(tokens(table)) & SUSPECT_TOKENS:
                     limitations.append("Table name suggests a backup, temporary, or log table.")
                 result = tools.propose_candidate(
@@ -167,7 +272,11 @@ class HeuristicPlanner:
                     confidence=confidence,
                 )
                 if "candidate_id" in result:
+                    if tools.validate_topology:
+                        self._validate_node(node, table, tools)
                     return f"Proposed {node.name} -> {table}.{column['name']} ({result['candidate_id']})."
+        if tools.validate_topology and scored:
+            self._validate_node(node, scored[0][2], tools, tentative=True)
         return None
 
     # ----- edges -------------------------------------------------------------
@@ -253,11 +362,30 @@ class HeuristicPlanner:
 
         options.sort(key=lambda o: -o[0])
         for coverage, table, from_col, from_chain, to_col, to_chain, joins, observed, extra_evidence in options:
+            if tools.validate_topology:
+                mismatch = bool(edge.cardinality and not _cardinality_compatible(observed, edge.cardinality))
+                incomplete = bool(extra_evidence) or any(j["scope"] != "full" for j in joins)
+                status = "inconclusive" if incomplete or tools.independent_samples else "mismatch" if mismatch else "supported"
+                tools.record_topology_finding(
+                    f"edge:{edge.name}", "cardinality", status,
+                    f"Possible relationship via '{table}' has observed {edge.from_type}->{edge.to_type} "
+                    f"cardinality '{observed}', declared '{edge.cardinality or 'unspecified'}', "
+                    f"minimum row coverage {coverage:.0%}.",
+                    f"Consider changing Cardinality to {observed} after confirming endpoint mappings and entity grain."
+                    if status == "mismatch" else
+                    "Validate joins on representative data and confirm endpoint mappings before revising cardinality."
+                    if status == "inconclusive" else "",
+                    [tools.inventory[table]["evidence_id"], *[j["evidence_id"] for j in joins], *extra_evidence],
+                    ["Observed one-sided uniqueness does not justify narrowing a declared many-side.",
+                     "Join coverage and cardinality do not prove the relationship's business meaning."],
+                )
             properties = _match_properties(edge.properties, tools.inventory[table]["columns"], exclude={from_col, to_col})
             mapping = {
                 "edge_type": edge.name,
                 "from_node_type": edge.from_type,
                 "to_node_type": edge.to_type,
+                "from_mapping_id": a["mapping_id"],
+                "to_mapping_id": b["mapping_id"],
                 "source_table": table,
                 "from_key_columns": [from_col],
                 "from_key_transforms": [from_chain],
@@ -341,15 +469,3 @@ def _covered_elements(ctx: IterationContext) -> dict[str, set[str]]:
         elif cand["kind"] == "edge_mapping":
             edges.add(cand["mapping"]["edge_type"])
     return {"nodes": nodes, "edges": edges}
-
-
-def _node_mappings(ctx: IterationContext) -> dict[str, dict]:
-    """Prefer approved facts; fall back to pending candidates for exploration."""
-    result: dict[str, dict] = {}
-    for cand in ctx.snapshot["pending"]:
-        if cand["kind"] == "node_mapping" and cand.get("scope", {}).get("source") == ctx.source:
-            result.setdefault(cand["mapping"]["node_type"], {**cand["mapping"], "_status": "pending"})
-    for fact in ctx.snapshot["facts"]:
-        if fact["kind"] == "node_mapping" and fact.get("source") == ctx.source:
-            result[fact["mapping"]["node_type"]] = {**fact["mapping"], "_status": "approved"}
-    return result

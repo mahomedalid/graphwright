@@ -32,9 +32,9 @@ def _metrics(row: sqlite3.Row) -> dict:
     }
 
 
-def _matches(query: str, node_id: str, properties: str) -> bool:
+def _matches(query: str, node_id: str, key: str, properties: str) -> bool:
     values = json.loads(properties).values()
-    return query in " ".join([node_id, *(str(value) for value in values)]).lower()
+    return query in " ".join([node_id, key, *(str(value) for value in values)]).lower()
 
 
 def _metrics_cte(
@@ -149,7 +149,7 @@ class _SQLiteSession(GraphIndex):
             conditions.append("n.type = ?")
             params.append(node_type)
         if query.strip():
-            conditions.append("ddg_matches(?, n.id, n.properties)")
+            conditions.append("ddg_matches(?, n.id, n.key, n.properties)")
             params.append(query.lower().strip())
         order = {
             "source": "n.system_id", "id": "n.id",
@@ -177,7 +177,7 @@ class SQLiteGraphIndex(GraphIndex):
         try:
             with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)) as conn:
                 conn.row_factory = sqlite3.Row
-                conn.create_function("ddg_matches", 3, _matches, deterministic=True)
+                conn.create_function("ddg_matches", 4, _matches, deterministic=True)
                 conn.execute("BEGIN")
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
                 metadata = conn.execute("SELECT value FROM graph_metadata WHERE key = 'format'").fetchone()

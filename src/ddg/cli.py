@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import runpy
 import sys
 
@@ -162,13 +163,25 @@ def cmd_run(args) -> int:
             return 2
         source = next(iter(settings.sources))
     run = runner.create_run(source, args.planner, _limits(args), resume_from=getattr(args, "run_id", None),
-                            mode=args.mode)
+                            mode=args.mode, validate_topology=args.validate_topology, discovery_scope=args.discovery_scope)
     print(f"Mode: {run['mode']}")
+    print(f"Discovery scope: {run['discovery_scope']}")
     print(f"Started {run['id']} in workspace '{settings.workspace}' on source '{run['source']}'")
     result = runner.execute(run["id"])
     for item in result["iterations"]:
         print(f"  iteration {item['iteration']}: {item.get('summary', '')} new={item['new_candidates']}")
     print(f"{result['status']} ({result['termination_reason']}) usage={result['usage']}")
+    for finding in result.get("topology_findings", []):
+        print(f"  [{finding['status']}] {finding['element']} / {finding['aspect']}: {finding['finding']}")
+        if finding["recommendation"]:
+            print(f"    Recommendation: {finding['recommendation']}")
+        print(f"    Evidence: {', '.join(finding['evidence_ids'])}")
+        for limitation in finding["limitations"]:
+            print(f"    Limitation: {limitation}")
+    tested = {finding["element"] for finding in result.get("topology_findings", [])}
+    for target in result.get("validation_targets", []):
+        if target not in tested:
+            print(f"  Not tested: {target}")
     if result.get("error"):
         print(result["error"], file=sys.stderr)
     return 0 if result["status"] != "failed" else 1
@@ -257,17 +270,43 @@ def cmd_generate(args) -> int:
     from .codegen import CodegenError, generate
 
     try:
-        result = generate(
-            _settings(args), args.source, allow_stale=args.allow_stale,
-            exclude_fact_ids=args.exclude_fact,
-        )
+        if args.target == "databricks-notebooks":
+            from .databricks_export import generate as generate_notebooks
+
+            if args.allow_stale:
+                raise ValueError("--allow-stale is only supported for the standalone target; review old approvals first")
+            bindings = None
+            if args.table_bindings is not None:
+                try:
+                    bindings = json.loads(args.table_bindings)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("--table-bindings must be a JSON object mapping sample tables to Databricks tables") from exc
+                if not isinstance(bindings, dict) or not all(
+                    isinstance(key, str) and isinstance(value, str) for key, value in bindings.items()
+                ):
+                    raise ValueError("--table-bindings must be a JSON object with string table names and values")
+            result = generate_notebooks(
+                _settings(args), args.source, exclude_fact_ids=args.exclude_fact, table_bindings=bindings,
+            )
+        else:
+            if args.table_bindings is not None:
+                raise ValueError("--table-bindings requires --target databricks-notebooks")
+            result = generate(
+                _settings(args), args.source, allow_stale=args.allow_stale,
+                exclude_fact_ids=args.exclude_fact,
+            )
     except CodegenError as exc:
         print(str(exc), file=sys.stderr)
         return 2
     print(f"Generated {result['path']}")
     for warning in result["warnings"]:
         print(f"WARNING: {warning}")
-    print(f"Review it, then run from the repository root: {result['suggested_command']}")
+    if args.target == "databricks-notebooks":
+        print("Resolved source bindings:")
+        print(json.dumps(result["source_bindings"], indent=2))
+        print("Extract the ZIP, then import the four Python source notebooks into the same Databricks folder. Review bindings and configuration, then run manually. Nothing was executed.")
+    else:
+        print(f"Review it, then run from the repository root: {result['suggested_command']}")
     return 0
 
 
@@ -289,8 +328,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-w", "--workspace", default=None, help="Workspace name (default: active workspace)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    def add(name: str, func, help_text: str):
-        p = sub.add_parser(name, help=help_text, parents=[common])
+    def add(name: str, func, help_text: str, *, aliases: tuple[str, ...] = ()):
+        p = sub.add_parser(name, help=help_text, parents=[common], aliases=aliases)
         p.set_defaults(func=func)
         return p
 
@@ -332,6 +371,10 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--max-minutes", type=float)
         p.add_argument("--max-iterations", type=int)
         p.add_argument("--max-cost-usd", type=float)
+        p.add_argument("--validate-topology", action=argparse.BooleanOptionalAction, default=None,
+                       help="Test topology assumptions and recommend edits without changing the topology")
+        p.add_argument("--discovery-scope", choices=["all", "edges"],
+                       help="edges = only discover relationships using existing approved or pending node mappings")
 
     add("cancel", cmd_cancel, "Request cancellation of an active run").add_argument("run_id")
     add("runs", cmd_runs, "List runs")
@@ -358,8 +401,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--notes", default="")
     p.add_argument("--observations", default="")
 
-    p = add("generate", cmd_generate, "Generate graph-building code from approved facts")
+    p = add("generate", cmd_generate, "Generate graph-building code from approved facts", aliases=("codegen",))
     p.add_argument("--source", required=True)
+    p.add_argument("--target", choices=["standalone", "databricks-notebooks"], default="standalone",
+                   help="Standalone Python builder (default) or a manually executed Databricks notebook ZIP")
+    p.add_argument("--table-bindings", metavar="JSON",
+                   help='Notebook-only table overrides, e.g. \'{"sample_table":"catalog.schema.table"}\'')
     p.add_argument("--allow-stale", action="store_true", help="Include facts flagged for revalidation")
     p.add_argument("--exclude-fact", action="append", default=[], metavar="FACT_ID",
                    help="Leave an approved fact out of this build only (repeat for multiple facts)")

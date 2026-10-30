@@ -117,7 +117,7 @@ class GraphIndex:
             if node_type and node["type"] != node_type:
                 continue
             if q:
-                haystack = " ".join([node["id"], *(str(v) for v in node["properties"].values())]).lower()
+                haystack = " ".join([node["id"], node["key"], *(str(v) for v in node["properties"].values())]).lower()
                 if q not in haystack:
                     continue
             metrics = self._metrics(node["id"], [edge_type] if edge_type else None, direction, neighbor_type)

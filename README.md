@@ -16,6 +16,171 @@ uv run ddg serve
 
 Open <http://127.0.0.1:8000> and select **Start run**.
 
+### Validate an existing topology
+
+Select **Validate topology against the data** when starting a run. This objective
+is independent of conservative/exploratory mode and works with the Foundry and
+offline heuristic planners, but not the profile-only planner.
+
+The run details show evidence-backed findings marked **supported**, **mismatch**,
+or **inconclusive**, with recommendations for revising keys, properties, or
+relationship cardinality. Foundry can also recommend new types and test other
+topology assumptions. The offline planner uses naming heuristics and key/join
+checks; it does not interpret arbitrary business constraints. Untested elements
+and constraints remain visible, including when a budget stops the run early.
+Missing columns or sample overlap are not proof that a topology element is wrong.
+
+Recommendations are advisory: they never change your topology or approve facts.
+Review the evidence and business meaning, edit the topology yourself, then run
+validation again. Resume keeps the original validation objective and findings
+when the topology version is unchanged.
+
+```powershell
+uv run ddg run --validate-topology --planner heuristic --max-iterations 20
+```
+
+The API accepts `"validate_topology": true` on a run request. Run responses persist
+`topology_findings`, including recommendations, limitations, and cited evidence.
+CLI validation runs print these findings after execution.
+
+### Discover relationships only
+
+Choose **Discovery target > Relationships only** to investigate edges without
+proposing new nodes, annotations, or observation candidates. Existing approved
+node facts take precedence over pending node mappings; pending endpoint
+dependencies are flagged in relationship proposals.
+
+```powershell
+uv run ddg run --planner heuristic --discovery-scope edges --max-iterations 20
+```
+
+The API accepts `"discovery_scope": "edges"` (`"all"` is the default). Resumed runs
+keep their original scope; start a new run to change it. Edges-only discovery can
+be combined with topology validation, which then produces relationship findings
+only. Profile-only runs cannot use this scope.
+
+Relationships without existing endpoint mappings are reported as blocked, not
+silently treated as discovered. Run full discovery or review endpoint mappings
+first. A run with blocked relationships ends with `missing_endpoint_mappings`.
+The Foundry planner uses isolated shared rules, scope-specific prompts, and an
+optional topology-validation prompt. Tool-side guards also reject non-edge
+proposals, so scope is not enforced by prompting alone.
+
+### Source-record identity and composite keys
+
+Generated node IDs are single readable strings:
+`<entity-type>:<identity-namespace>:<ordered-normalized-key-values>`.
+For example, `Device:IMEI:012312389` or `Account:V21_BAN:12345`.
+Each component is UTF-8 percent-escaped, including embedded colons and percent
+signs, so composite values cannot collide through separator ambiguity.
+
+Node mappings require an explicit `identity_namespace` describing the semantic
+identifier scope. Include source system, issuer or line of business when needed
+to distinguish identifiers. Tables, source connection names, and normalization
+rules are not automatically embedded in the ID. Renaming a table or connection
+does not change IDs when the semantic contract and normalized values stay the same.
+Normalization changes that alter values can change IDs.
+
+A single source ID column is valid inside this composite namespace. Multiple
+columns are supported when the source-record grain requires them. Different
+mappings of the same node type can have different key shapes; matching values
+or matching key counts never establish shared identity. Mappings may deliberately
+share a namespace only when evidence supports the same identity. Their ordered
+`identity_key_parts` (semantic names, defaulting to `key_columns`) and
+`key_transforms` must agree, even if physical column names differ. Choose different
+namespaces for different identifier kinds. IMEI and serial-number records do not
+become the same Device automatically.
+
+The offline planner proposes conservative source-record-scoped namespaces and
+flags that limitation for review. The Foundry planner can propose semantic
+namespaces based on evidence; neither planner approves mappings.
+
+Relationship mappings use `from_mapping_id` and `to_mapping_id` to select
+specific endpoint contracts. Discovery exposes every active node contract and
+its stable candidate ID; approved fact IDs are also accepted as references.
+Each relationship must provide all endpoint key parts in order, with transforms
+that produce the endpoint's normalized values. Discovery validates this in both
+full and edges-only runs, and records the selected endpoint IDs before review.
+Pending endpoint approvals remain explicit dependencies.
+
+Existing approved facts are not rewritten. Node approvals without an explicit
+semantic namespace are flagged for corrected proposals and review, not assigned
+one automatically. A legacy relationship without endpoint
+references can be built only when each endpoint has one available approved
+mapping. Ambiguous references, unavailable targets, and missing key parts appear
+in fact-validation and code-generation errors. Review a corrected mapping or
+explicitly exclude the relationship; renewing an old approval cannot repair it.
+
+Newly generated builders record `inputs.identity_format = "semantic/v1"` and
+the identity contracts in graph metadata. Their node IDs differ from older
+`Type:key` and table-scoped hashed IDs. Regenerate and review your builder, then rebuild your graph to
+use the new IDs; existing graph snapshots and saved approvals stay unchanged.
+Key-value search remains available in both JSON and SQLite graphs.
+
+### Databricks notebook export
+
+Export approved SQLite-discovered rules for execution against the original
+Databricks sources. In Facts, choose the Databricks notebooks target, review
+the selected facts and table-binding overrides, then download the ZIP.
+The existing standalone builder remains the default.
+
+```powershell
+uv run ddg --workspace mydata codegen --source local --target databricks-notebooks
+```
+
+Bindings come from the SQLite `_sample_manifest` (`sqlite_table` to
+`source_table`). Missing or ambiguous bindings require explicit
+`--table-bindings '{"local_table":"catalog.schema.original_table"}'` overrides;
+names are never guessed from flattened underscores. The workspace API accepts
+the same `target`, `table_bindings`, and `exclude_fact_ids` options on its
+code-generation endpoint and provides an authorized ZIP download.
+
+Import the four source notebooks into one Databricks folder:
+
+1. `00_configure_preflight`: edit bindings, Delta versions, output names and
+   policies; verify schemas and GraphFrames Python/JVM compatibility.
+2. `10_build_validate`: build distributed `vertices_df`, `edges_df`, and `g`,
+   then inspect aggregate diagnostics and restricted invalid-row DataFrames.
+3. `20_publish`: rebuild in its own session, review that exact build, and
+   separately confirm replacement of the two current-state managed Delta tables.
+4. `30_explore`: choose a fresh in-memory build or a version-pinned,
+   consistency-checked published graph.
+
+The package embeds frozen mapping/endpoint contracts, approval revisions,
+topology, exclusions and a deterministic rules fingerprint. It contains no
+source rows, credentials, saved outputs, or repository imports. Export does
+not execute notebooks or change approvals. Unsupported derivations, stale
+approvals, missing semantic namespaces, and unstable `dedupe=false` edge
+identities block export with per-fact errors.
+
+Python worker UDFs preserve the local builder's exact Unicode, normalization
+and UTF-8 percent-escaping semantics. Keys support strings, integral numbers
+and booleans. Scalar properties preserve JSON types; decimals, dates,
+timestamps and binary use the local builder's string representation.
+Complex properties and other key types require reviewed mappings.
+Timestamp properties require UTC workers as well as a UTC Spark session.
+Legacy `int` normalization still has its documented float-conversion precision
+limit; review large business identifiers rather than changing identity only
+in Spark.
+
+> [!WARNING]
+> Publication is disabled by default. It requires dedicated target ownership,
+> a protected scratch directory, an externally coordinated single writer, and
+> confirmation bound to both targets and the exact build. Two Delta overwrites
+> are not atomic. Guarded readers reject mixed pairs; other readers can observe
+> a replacement window. Failed stages are retained for manual recovery, not
+> automatically rolled back or deleted. Excluded types disappear on replacement.
+
+Run local export/guard tests with `python -m pytest
+tests/test_databricks_export.py tests/test_notebook_integration.py`.
+Optional distributed tests in `tests/test_notebook_spark.py` require
+PySpark 3.5.8 and Java 17 (or `jdk4py==17.0.9.2`). These are test-only
+prerequisites, not application dependencies. Local export tests do not certify
+a Databricks Runtime/GraphFrames combination. Your administrator must provision
+compatible compute; the notebooks install nothing automatically.
+See the [notebook export PRD](docs/prds/databricks-graph-notebook-export.md)
+and the package README for execution, replacement and recovery details.
+
 ### 2. Create your workspace
 
 ```powershell
@@ -133,8 +298,13 @@ unverified background material in every iteration. They do not become approved f
 or executable instructions. The offline heuristic planner does not interpret them.
 
 Documents are loaded once at the start of each run; start a new run to pick up edits.
-The run record lists additional documents in `context_files`. Files must be UTF-8;
-unreadable files fail the run rather than being silently omitted.
+The run record lists additional documents in `context_files`. Open a run's
+**Run settings and usage** to see **Context references loaded**. The `context_loaded`
+technical event records `file_count` and the workspace-relative `files` list, without
+document contents. These list files loaded, not proof that the model used every
+reference in its reasoning. The configured topology is loaded separately and is
+not included in this reference list. Files must be UTF-8; unreadable files fail the
+run rather than being silently omitted.
 
 > [!WARNING]
 > Free-form topology and reference documents are sent to the configured model without the source-column
@@ -181,6 +351,21 @@ In the UI, with **mydata** selected:
 1. **Runs**: select **Start run**.
 2. **Review**: approve or reject each candidate, with notes.
 3. **Facts & Code**: select **Generate graph builder code**, then run the command it shows.
+
+For an approved fact that cannot be corrected or revalidated, select **Delete fact**
+in **Facts & Code**. Supply your reviewer name and reason, and type its exact fact
+ID to confirm. Only that fact is removed from active knowledge. Its original
+record, evidence, approval history, and deletion audit remain stored, and its
+candidate becomes rejected so the same interpretation is not immediately
+rediscovered without new evidence.
+
+Dependent relationship facts are not deleted automatically. Review them after
+deleting a node fact. Previously generated builders and graph snapshots are
+unchanged; generate a new builder to use the remaining active facts.
+Deletion is also available for structurally invalid mappings and when the source
+is unreachable. The API uses `DELETE /api/w/{workspace}/facts/{fact_id}` with
+`reviewer`, `notes`, `confirm` (the fact ID), and `expected_token` from the fact
+revalidation report. Stale review tokens are rejected.
 4. **Dictionary**: select **Profile columns**, then document tables and columns (see [Data Dictionary](#data-dictionary)).
 5. **Graph**: search and explore.
 

@@ -62,7 +62,11 @@ def test_foundry_planner_enforces_budget_before_model_call(settings, store):
     assert control.usage.model_calls == 0
 
 
-def test_given_references_when_foundry_runs_then_prompt_contains_full_text_and_paths(settings, store, monkeypatch):
+@pytest.mark.parametrize("validate_topology", [False, True])
+@pytest.mark.parametrize("discovery_scope", ["all", "edges"])
+def test_given_references_when_foundry_runs_then_prompt_contains_full_text_and_paths(
+    settings, store, monkeypatch, validate_topology, discovery_scope, expected,
+):
     import agent_framework
     import agent_framework.foundry
     import azure.identity.aio
@@ -72,6 +76,20 @@ def test_given_references_when_foundry_runs_then_prompt_contains_full_text_and_p
     settings.model.model = "gpt-test"
     control = RunControl(settings.limits, settings.model, cancel_requested=lambda: False)
     tools = _tools(settings, store, control)
+    tools.validate_topology = validate_topology
+    tools.discovery_scope = discovery_scope
+    for node, mapping in expected["nodes"].items():
+        store.add_candidate({
+            "kind": "node_mapping", "hypothesis": f"Existing {node} mapping",
+            "mapping": {"node_type": node, "identity_namespace": f"{node}_ID", **mapping},
+            "scope": {"source": "retail"}, "evidence": [],
+        })
+    alternate = store.add_candidate({
+        "kind": "node_mapping", "hypothesis": "Alternative Customer source",
+        "mapping": {"node_type": "Customer", "source_table": "alternate_endpoint_source",
+                    "key_columns": ["source_id", "local_id"], "identity_namespace": "ALTERNATE_CUSTOMER_ID"},
+        "scope": {"source": "retail"}, "evidence": [],
+    })
     prompts = []
     instructions = []
 
@@ -102,9 +120,19 @@ def test_given_references_when_foundry_runs_then_prompt_contains_full_text_and_p
 
     result = FoundryPlanner(settings, control).run_iteration(ctx, tools)
 
-    assert result.done
+    assert result.done is (not validate_topology and discovery_scope == "all")
     assert json.dumps(documents, ensure_ascii=False) in prompts[0]
     assert "untrusted background data" in instructions[0]
+    assert "Existing endpoint mappings for this source" in prompts[0]
+    assert alternate["id"] in prompts[0] and "alternate_endpoint_source" in prompts[0]
+    assert '"identity_namespace"' in prompts[0] and '"mapping_id"' in prompts[0]
+    assert ("TOPOLOGY VALIDATION" in instructions[0]) is validate_topology
+    assert ("Discovery scope: EDGES ONLY." in instructions[0]) is (discovery_scope == "edges")
+    if discovery_scope == "edges":
+        assert "Build the data dictionary" not in instructions[0]
+        assert "Existing endpoint mappings for this source" in prompts[0]
+        assert '"Customer"' in prompts[0]
+    assert ("record_topology_finding" in {function.__name__ for function in build_agent_tools(tools)}) is validate_topology
 
 
 @pytest.mark.parametrize("outcome", ["success", "error", "timeout", "middleware_error"])

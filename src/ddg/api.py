@@ -11,11 +11,11 @@ import secrets
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -56,12 +56,16 @@ class RunRequest(BaseModel):
     planner: str | None = None
     mode: str | None = Field(default=None, pattern="^(conservative|exploratory)$")
     limits: dict[str, Any] = Field(default_factory=dict)
+    validate_topology: bool = False
+    discovery_scope: str = Field(default="all", pattern="^(all|edges)$")
 
 
 class ResumeRequest(BaseModel):
     planner: str | None = None
     mode: str | None = Field(default=None, pattern="^(conservative|exploratory)$")
     limits: dict[str, Any] = Field(default_factory=dict)
+    validate_topology: bool | None = None
+    discovery_scope: str | None = Field(default=None, pattern="^(all|edges)$")
 
 
 class ResetRequest(BaseModel):
@@ -80,6 +84,8 @@ class DecisionRequest(BaseModel):
 
 class CodegenRequest(BaseModel):
     source: str
+    target: Literal["standalone", "databricks-notebooks"] = "standalone"
+    table_bindings: dict[str, str] | None = None
     allow_stale: bool = False
     exclude_fact_ids: list[str] = Field(default_factory=list)
 
@@ -90,6 +96,13 @@ class FactRevalidationRequest(BaseModel):
     expected_token: str = Field(min_length=1)
     expected_topology_version: str = Field(min_length=1)
     confirm_meaning: bool = False
+
+
+class FactDeletionRequest(BaseModel):
+    reviewer: str = Field(min_length=1, max_length=200)
+    notes: str = Field(min_length=1, max_length=5000)
+    expected_token: str = Field(min_length=1)
+    confirm: str = Field(min_length=1)
 
 
 class WorkspaceRequest(BaseModel):
@@ -251,7 +264,8 @@ def create_app(root: Path | None = None) -> FastAPI:
         if body.source not in ctx.settings.sources:
             raise HTTPException(400, f"Unknown source '{body.source}' in workspace '{ctx.settings.workspace}'")
         try:
-            run = ctx.runner.create_run(body.source, body.planner, body.limits, mode=body.mode)
+            run = ctx.runner.create_run(body.source, body.planner, body.limits, mode=body.mode,
+                                        validate_topology=body.validate_topology, discovery_scope=body.discovery_scope)
         except (ValueError, KeyError) as exc:
             raise HTTPException(400, str(exc)) from exc
         start_thread(ctx, run["id"])
@@ -275,7 +289,8 @@ def create_app(root: Path | None = None) -> FastAPI:
         previous = _get_run(ctx.store, run_id)
         try:
             run = ctx.runner.create_run(previous["source"], body.planner or previous.get("planner"), body.limits,
-                                        resume_from=run_id, mode=body.mode or previous.get("mode"))
+                                        resume_from=run_id, mode=body.mode or previous.get("mode"),
+                                        validate_topology=body.validate_topology, discovery_scope=body.discovery_scope)
         except (ValueError, KeyError) as exc:
             raise HTTPException(409, str(exc)) from exc
         start_thread(ctx, run["id"])
@@ -438,11 +453,36 @@ def create_app(root: Path | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
+    @ws.delete("/facts/{fact_id}")
+    def delete_fact(fact_id: str, body: FactDeletionRequest, ctx: WorkspaceContext = Depends(workspace_ctx)) -> dict:
+        try:
+            return ctx.store.delete_fact(
+                fact_id, reviewer=body.reviewer, notes=body.notes,
+                expected_token=body.expected_token, confirm=body.confirm,
+            )
+        except KeyError:
+            _not_found(fact_id)
+        except ConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @ws.post("/codegen")
     def codegen(body: CodegenRequest, ctx: WorkspaceContext = Depends(workspace_ctx)):
         if body.source not in ctx.settings.sources:
             raise HTTPException(400, f"Unknown source '{body.source}'")
         try:
+            if body.target == "databricks-notebooks":
+                from .databricks_export import generate as generate_notebooks
+
+                if body.allow_stale:
+                    raise CodegenError(["Notebook export requires current approvals. Review old approvals; allow_stale is standalone-only."])
+                return generate_notebooks(
+                    ctx.settings, body.source, store=ctx.store,
+                    exclude_fact_ids=body.exclude_fact_ids, table_bindings=body.table_bindings,
+                )
+            if body.table_bindings is not None:
+                raise CodegenError(["table_bindings requires target 'databricks-notebooks'."])
             return generate(
                 ctx.settings, body.source, allow_stale=body.allow_stale, store=ctx.store,
                 exclude_fact_ids=body.exclude_fact_ids,
@@ -453,6 +493,35 @@ def create_app(root: Path | None = None) -> FastAPI:
     @ws.get("/codegen")
     def generated(ctx: WorkspaceContext = Depends(workspace_ctx)) -> list[dict]:
         return list_generated(ctx.settings)
+
+    @ws.get("/codegen/{name}/download")
+    def download_generated(name: str, ctx: WorkspaceContext = Depends(workspace_ctx)) -> FileResponse:
+        if not name.endswith(".zip") or any(char in name for char in ("/", "\\", ":", "\x00")):
+            raise HTTPException(404, "Generated notebook package not found")
+        directory = ctx.settings.sandbox_dir / "generated"
+        path = directory / name
+        manifest_path = path.with_suffix(".manifest.json")
+        workspace = ctx.settings.workspace_dir.resolve()
+        if (
+            not directory.resolve().is_relative_to(workspace)
+            or path.resolve().parent != directory.resolve()
+            or manifest_path.resolve().parent != directory.resolve()
+            or path.is_symlink() or manifest_path.is_symlink()
+            or not path.is_file() or not manifest_path.is_file()
+        ):
+            raise HTTPException(404, "Generated notebook package not found")
+        try:
+            manifest = read_json(manifest_path)
+        except (OSError, ValueError):
+            raise HTTPException(404, "Generated notebook package manifest is unavailable") from None
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("target") != "databricks-notebooks"
+            or manifest.get("workspace") != ctx.settings.workspace
+            or manifest.get("builder") != name
+        ):
+            raise HTTPException(404, "Generated notebook package not found")
+        return FileResponse(path, media_type="application/zip", filename=name)
 
     # ---- data dictionary ------------------------------------------------------------
     def _dictionary_source(ctx: WorkspaceContext, source: str) -> None:
@@ -603,5 +672,5 @@ def _get_run(store: Store, run_id: str) -> dict:
 def _run_brief(run: dict) -> dict:
     return {
         k: run.get(k)
-        for k in ("id", "created_at", "status", "source", "planner", "mode", "resumed_from", "termination_reason", "error", "usage", "ended_at", "elapsed_seconds", "topology_version")
+        for k in ("id", "created_at", "status", "source", "planner", "mode", "validate_topology", "discovery_scope", "resumed_from", "termination_reason", "error", "usage", "ended_at", "elapsed_seconds", "topology_version")
     } | {"iterations": len(run.get("iterations", [])), "candidates": sum(len(i.get("new_candidates", [])) for i in run.get("iterations", []))}

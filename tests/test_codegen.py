@@ -56,7 +56,7 @@ def test_generated_builder_produces_reproducible_graph(settings, store):
     assert first["stats"]["dangling_edges"] == orphan_orders and first["warnings"]
     assert len({n["id"] for n in first["nodes"]}) == len(first["nodes"])
 
-    customer = next(n for n in first["nodes"] if n["id"] == "Customer:12")
+    customer = next(n for n in first["nodes"] if n["type"] == "Customer" and n["key"] == "12")
     assert customer["properties"]["email"].endswith("@example.com")
     assert customer["provenance"][0]["table"] == "CUST_MASTER"
     edge = next(e for e in first["edges"] if e["type"] == "CONTAINS")
@@ -65,12 +65,12 @@ def test_generated_builder_produces_reproducible_graph(settings, store):
     assert (out_dir / "a.graphml").read_text(encoding="utf-8").startswith("<?xml")
 
     index = GraphIndex(first, out_dir / "a.json")
-    hood = index.neighborhood("Customer:12", depth=2, limit=40)
+    hood = index.neighborhood(customer["id"], depth=2, limit=40)
     assert any(e["type"] == "PLACED" for e in hood["edges"]) and len(hood["nodes"]) <= 40
     assert index.search("example.com", "Customer", limit=5)
     sql_index = GraphRepository(out_dir).get("a.sqlite")
     assert sql_index.search("example.com", "Customer", limit=5) == index.search("example.com", "Customer", limit=5)
-    assert sql_index.neighborhood("Customer:12", depth=2, limit=40) == hood
+    assert sql_index.neighborhood(customer["id"], depth=2, limit=40) == hood
     cypher = (out_dir / "a.cypher").read_text(encoding="utf-8")
     assert cypher.count("MERGE (n:DDGNode") == len(first["nodes"])
     assert cypher.count("MERGE (s)-[r:") == len(first["edges"])

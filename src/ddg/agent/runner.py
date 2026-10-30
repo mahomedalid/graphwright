@@ -8,14 +8,15 @@ import traceback
 from typing import Any
 
 from ..adapters import create_adapter
-from ..config import MODES, Settings
+from ..config import DISCOVERY_SCOPES, MODES, Settings
+from ..mappings import available_node_mappings
 from ..context import load_context_documents
 from ..control import RunControl, StopRun
 from ..narrative import facts_story, iteration_activity, run_story
 from ..store import Store, atomic_write_json, new_id, utcnow
 from ..tools import DiscoveryTools
 from ..topology import TopologyError, load_workspace_topology
-from .base import IterationContext, Planner
+from .base import IterationContext, IterationResult, Planner
 from .heuristic import HeuristicPlanner
 
 ACTIVE_STATES = ("queued", "running", "stopping")
@@ -51,6 +52,8 @@ class DiscoveryRunner:
         limits: dict[str, Any] | None = None,
         resume_from: str | None = None,
         mode: str | None = None,
+        validate_topology: bool | None = None,
+        discovery_scope: str | None = None,
     ) -> dict:
         self.settings.source(source)
         mode = (mode or self.settings.mode).lower()
@@ -66,6 +69,21 @@ class DiscoveryRunner:
                 raise ValueError(f"Run {resume_from} has no checkpoint to resume from")
             if previous["source"] != source:
                 raise ValueError("A resumed run must use the same source")
+            previous_validation = previous.get("validate_topology", False)
+            if validate_topology is not None and validate_topology != previous_validation:
+                raise ValueError("Start a new run to change the topology validation objective")
+            validate_topology = previous_validation
+            previous_scope = previous.get("discovery_scope", "all")
+            if discovery_scope is not None and discovery_scope != previous_scope:
+                raise ValueError("Start a new run to change the discovery scope")
+            discovery_scope = previous_scope
+        discovery_scope = discovery_scope or "all"
+        if discovery_scope not in DISCOVERY_SCOPES:
+            raise ValueError(f"discovery_scope must be one of {', '.join(DISCOVERY_SCOPES)}")
+        if validate_topology and (planner or self.settings.planner).lower() == "profile":
+            raise ValueError("Topology validation requires auto, foundry, or heuristic planner, not profile")
+        if discovery_scope == "edges" and (planner or self.settings.planner).lower() == "profile":
+            raise ValueError("Edges-only discovery requires auto, foundry, or heuristic planner, not profile")
         merged = self.settings.limits.merged(limits)
         run = {
             "id": new_id("run"),
@@ -74,6 +92,9 @@ class DiscoveryRunner:
             "source": source,
             "planner": planner or self.settings.planner,
             "mode": mode,
+            "validate_topology": bool(validate_topology),
+            "discovery_scope": discovery_scope,
+            "topology_findings": [],
             "limits": merged.__dict__,
             "resumed_from": resume_from,
             "iterations": [],
@@ -119,9 +140,15 @@ class DiscoveryRunner:
                          node_types=len(topology.node_types), edge_types=len(topology.edge_types))
             control.emit("context_loading")
             context_documents = load_context_documents(self.settings.workspace_dir, self.settings.topology_file)
-            control.emit("context_loaded", file_count=len(context_documents))
             run["context_files"] = [document["path"] for document in context_documents]
+            control.emit("context_loaded", file_count=len(context_documents), files=run["context_files"])
             run["topology_version"] = topology.version
+            if run.get("validate_topology"):
+                run["validation_targets"] = (
+                    ([] if run.get("discovery_scope") == "edges" else [f"node:{name}" for name in topology.node_types])
+                    + [f"edge:{name}" for name in topology.edge_types]
+                    + ([] if run.get("discovery_scope") == "edges" else [f"constraint:{text}" for text in topology.constraints])
+                )
             self.store.reconcile()
             source_cfg = self.settings.source(run["source"])
             control.emit("source_connecting", source=source_cfg.name, source_type=source_cfg.type)
@@ -136,7 +163,17 @@ class DiscoveryRunner:
                 self.settings, self.store, adapter, topology, control, run_id, checkpoint["evidence_index"],
                 mode=run.get("mode") or self.settings.mode,
                 independent_samples=bool(source_cfg.options.get("independent_samples", False)),
+                validate_topology=run.get("validate_topology", False),
+                discovery_scope=run.get("discovery_scope", "all"),
             )
+            if run.get("resumed_from") and previous.get("topology_version") == topology.version:
+                prior_run = self.store.get_run(run["resumed_from"])
+                if prior_run is None:
+                    raise KeyError(f"Run {run['resumed_from']} is no longer available")
+                tools.topology_findings.extend(copy.deepcopy(prior_run.get("topology_findings", [])))
+            elif run.get("validate_topology"):
+                checkpoint["memory"].pop("validation_visited", None)
+            run["topology_findings"] = tools.topology_findings
             self.store.save_run(run)
             control.emit("planner_selected", planner=planner.name)
 
@@ -150,14 +187,29 @@ class DiscoveryRunner:
                 iteration += 1
                 tools.iteration = iteration
                 snapshot = self.store.review_snapshot()
+                if tools.discovery_scope == "edges":
+                    node_maps = available_node_mappings(snapshot, run["source"])
+                    memory["blocked_edges"] = {
+                        edge.name: [name for name in (edge.from_type, edge.to_type) if name not in node_maps]
+                        for edge in topology.edge_types.values()
+                        if edge.from_type not in node_maps or edge.to_type not in node_maps
+                    }
                 proposed_before = len(tools.proposed)
                 evidence_before = len(tools.evidence_index)
+                findings_before = len(tools.topology_findings)
                 started = time.monotonic()
                 self.store.append_event(run_id, {"type": "iteration_started", "iteration": iteration, "review_snapshot_version": snapshot["version"]})
                 memory_before = copy.deepcopy({k: v for k, v in memory.items() if k != "agent_notes"})
                 ctx = IterationContext(iteration, run["source"], topology, snapshot, memory, context_documents)
                 try:
-                    result = planner.run_iteration(ctx, tools)
+                    if tools.discovery_scope == "edges" and len(memory["blocked_edges"]) == len(topology.edge_types):
+                        result = IterationResult(
+                            "No eligible relationships: the topology has no relationships or their endpoint mappings "
+                            "are missing. Run full discovery or review endpoint node mappings first.",
+                            memory, done=True,
+                        )
+                    else:
+                        result = planner.run_iteration(ctx, tools)
                 finally:
                     new_ids = [c["id"] for c in tools.proposed[proposed_before:]]
                     refusals = list(tools.proposal_errors)
@@ -190,10 +242,13 @@ class DiscoveryRunner:
                 # Stalled = no new candidates, no new evidence, and no planner decisions (for example ruling out a
                 # topology element). Free-text agent notes alone do not count as progress (PRD section 12).
                 memory_after = {k: v for k, v in memory.items() if k != "agent_notes"}
-                progressed = bool(new_ids) or len(tools.evidence_index) > evidence_before or memory_after != memory_before
+                progressed = (
+                    bool(new_ids) or len(tools.evidence_index) > evidence_before
+                    or len(tools.topology_findings) > findings_before or memory_after != memory_before
+                )
                 stalled = 0 if progressed else stalled + 1
                 if result.done:
-                    reason = "no_remaining_work"
+                    reason = "missing_endpoint_mappings" if memory.get("blocked_edges") else "no_remaining_work"
                 elif iteration - int(checkpoint["iteration"]) >= limits.max_iterations:
                     reason = "iteration_limit"
                 elif stalled >= limits.stall_iterations:

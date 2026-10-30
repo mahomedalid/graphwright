@@ -18,6 +18,7 @@ class Element {
   close() { this.open = false; }
   showModal() { this.open = true; }
   reset() {}
+  classList = { toggle() {} };
 }
 
 const fact = {
@@ -204,4 +205,261 @@ test("builder commands expose JSON, SQLite and Neo4j choices while preserving ol
   assert.match(choices.textContent, /Neo4j Cypher import/);
   assert.match(choices.textContent, /--sqlite-out graph.sqlite/);
   assert.match(app.run('builderCommands({suggested_command: "legacy command"})').textContent, /legacy command/);
+});
+
+test("notebook target exposes bindings and disables only the standalone stale bypass", () => {
+  const app = harness();
+  app.get("#codegen-target").value = "databricks-notebooks";
+  app.run("updateCodegenTarget()");
+  assert.equal(app.get("#allow-stale").disabled, true);
+  assert.match(app.get("#generate-btn").textContent, /Generate notebook package/);
+
+  app.get("#codegen-target").value = "standalone";
+  app.run("updateCodegenTarget()");
+  assert.equal(app.get("#allow-stale").disabled, false);
+  assert.match(app.get("#generate-btn").textContent, /Generate graph builder code/);
+});
+
+test("notebook generation forwards bindings and exclusions without bypassing stale approvals", async () => {
+  const app = harness(async () => { const error = new Error("blocked"); error.body = {errors: ["Missing source binding"]}; throw error; });
+  app.get("#codegen-target").value = "databricks-notebooks";
+  app.get("#table-bindings").value = '{"customers":"catalog.schema.customers"}';
+  app.get("#allow-stale").checked = true;
+  app.run('state.factExclusions.add("fact-1")');
+
+  await app.run("generateCode()");
+
+  const body = JSON.parse(app.calls[0].options.body);
+  assert.equal(body.target, "databricks-notebooks");
+  assert.equal(body.allow_stale, false);
+  assert.deepEqual(body.table_bindings, {customers: "catalog.schema.customers"});
+  assert.deepEqual(body.exclude_fact_ids, ["fact-1"]);
+  assert.match(app.get("#codegen-result").textContent, /supply explicit JSON overrides/);
+  assert.match(app.get("#codegen-result").textContent, /Missing source binding/);
+});
+
+test("notebook generation omits optional bindings when the override input is blank", async () => {
+  const app = harness(async () => { throw new Error("blocked"); });
+  app.get("#codegen-target").value = "databricks-notebooks";
+
+  await app.run("generateCode()");
+
+  assert.equal(JSON.parse(app.calls[0].options.body).table_bindings, undefined);
+});
+
+test("malformed notebook overrides fail locally with a correction message", async () => {
+  for (const value of ["broken", "[]", "null", '{"customers":3}']) {
+    const app = harness();
+    app.get("#codegen-target").value = "databricks-notebooks";
+    app.get("#table-bindings").value = value;
+
+    await app.run("generateCode()");
+
+    assert.equal(app.calls.length, 0);
+    assert.match(app.get("#codegen-result").textContent, /Correct the JSON/);
+  }
+});
+
+test("standalone generation ignores notebook-only form values and keeps legacy commands", async () => {
+  const app = harness(async () => { throw new Error("blocked"); });
+  app.get("#codegen-target").value = "standalone";
+  app.get("#table-bindings").value = "not valid JSON";
+  app.get("#allow-stale").checked = true;
+
+  await app.run("generateCode()");
+
+  const body = JSON.parse(app.calls[0].options.body);
+  assert.equal(body.target, "standalone");
+  assert.equal(body.allow_stale, true);
+  assert.equal(body.table_bindings, undefined);
+});
+
+test("notebook results expose package download and bindings rather than Python commands", async () => {
+  const app = harness(async (url, options) => {
+    if (options?.method === "POST") return {
+      target: "databricks-notebooks", builder: "notebooks.zip", path: "notebooks.zip",
+      warnings: [], source_bindings: {customers: "catalog.schema.customers"},
+    };
+    if (url.startsWith("/facts/revalidation")) return report;
+    return [];
+  });
+  app.run('state.factsSourceKey = "retail:retail"');
+  app.get("#codegen-target").value = "databricks-notebooks";
+  await app.run("generateCode()");
+  const text = app.get("#codegen-result").textContent;
+  assert.match(text, /Download notebook ZIP/);
+  assert.match(text, /Nothing was executed/);
+  assert.match(text, /extract the ZIP/);
+  assert.match(text, /four Python source notebooks into the same Databricks folder/);
+  assert.match(text, /catalog.schema.customers/);
+  assert.doesNotMatch(text, /View code|JSON snapshot|undefined/);
+});
+
+test("previous notebook artifacts retain their warnings and resolved bindings", async () => {
+  const app = harness(async (url) => {
+    if (url.startsWith("/facts/revalidation")) return report;
+    return [{
+      target: "databricks-notebooks", builder: "notebooks.zip", source: "retail", facts: [],
+      warnings: ["Full-data validation still required"],
+      source_bindings: {customers: "catalog.schema.customers"},
+    }];
+  });
+
+  await app.run("loadFacts()");
+
+  const text = app.get("#generated-list").textContent;
+  assert.match(text, /Full-data validation still required/);
+  assert.match(text, /Resolved source bindings/);
+  assert.match(text, /catalog.schema.customers/);
+  assert.match(text, /Download notebook ZIP/);
+});
+
+test("previous notebook package download stays scoped and offers actionable retry errors", async () => {
+  const app = harness();
+  app.run('downloadNotebookPackage = async (builder, workspace) => { if (workspace !== "retail") throw new Error("wrong workspace"); throw new Error("package missing"); }');
+  const controls = app.run('builderCommands({target: "databricks-notebooks", builder: "notebooks.zip"})');
+  app.run('state.ws = "other"');
+
+  await controls.children[0].events.click();
+
+  assert.equal(controls.children[0].disabled, false);
+  assert.match(controls.textContent, /package missing/);
+  assert.match(controls.textContent, /generate it again in its original workspace/);
+  assert.doesNotMatch(controls.textContent, /wrong workspace/);
+});
+
+test("ZIP responses use authenticated binary fetch rather than the JSON or text parser", async () => {
+  const app = harness();
+  app.run(`
+    localStorage.getItem = () => "download-token";
+    fetch = async (path, options) => {
+      globalThis.downloadFetch = {path, options};
+      return {
+        ok: true, status: 200,
+        headers: {get: () => "application/zip"},
+        blob: async () => ({kind: "zip-blob"}),
+        text: async () => { throw new Error("ZIP decoded as text"); }
+      };
+    };
+  `);
+
+  const blob = await app.run('api("/api/w/retail/codegen/notebooks.zip/download")');
+
+  assert.equal(blob.kind, "zip-blob");
+  assert.equal(app.run("downloadFetch.options.headers.Authorization"), "Bearer download-token");
+  assert.equal(app.run("downloadFetch.path"), "/api/w/retail/codegen/notebooks.zip/download");
+});
+
+test("failed package downloads preserve the API error for actionable retry feedback", async () => {
+  const app = harness();
+  app.run(`
+    fetch = async () => ({
+      ok: false, status: 404,
+      headers: {get: () => "application/json"},
+      json: async () => ({detail: "Generated notebook package not found"})
+    });
+  `);
+
+  await assert.rejects(app.run('api("/api/w/retail/codegen/missing.zip/download")'),
+    /Generated notebook package not found/);
+});
+
+test("switching sources clears notebook binding overrides", async () => {
+  const app = harness();
+  await app.run("loadFacts()");
+  app.get("#table-bindings").value = '{"customers":"other.schema.customers"}';
+  app.get("#facts-source").value = "other";
+  await app.run("loadFacts()");
+  assert.equal(app.get("#table-bindings").value, "");
+});
+
+test("uncorrectable facts still offer deletion even when revalidation is disabled", async () => {
+  const invalid = {...report, validations: {"fact-1": {...check, can_revalidate: false, errors: ["Invalid key"]}}};
+  const app = harness(async (url) => url.startsWith("/facts/revalidation") ? invalid : []);
+
+  await app.run("loadFacts()");
+  const actions = app.get("#facts-table tbody").children[0].children[4];
+
+  assert.match(actions.textContent, /Delete fact/);
+  assert.equal(actions.children[0].disabled, true);
+  assert.notEqual(actions.children[1].disabled, true);
+});
+
+test("deletion requires the exact fact ID, reviewer, and a reason before sending any request", async () => {
+  const app = harness();
+  app.run(`openFactDeletion(${JSON.stringify(fact)}, "fact-token")`);
+  app.get("#fact-deletion-reviewer").value = "reviewer";
+  app.get("#fact-deletion-notes").value = "Incorrect meaning.";
+  app.get("#fact-deletion-confirm").value = "wrong-id";
+
+  await app.run("submitFactDeletion({preventDefault() {}})");
+
+  assert.equal(app.calls.length, 0);
+  assert.match(app.get("#fact-deletion-error").textContent, /exact fact ID/);
+  assert.equal(app.get("#fact-deletion-dialog").open, true);
+});
+
+test("confirmed deletion sends a token and refreshes facts without rewriting previous builders", async () => {
+  let deleted = false;
+  const app = harness(async (url, options) => {
+    if (options?.method === "DELETE") { deleted = true; return {deleted: true, dependent_fact_ids: []}; }
+    if (url.startsWith("/facts/revalidation")) return {...report, facts: deleted ? [] : [fact]};
+    return [];
+  });
+  await app.run("loadFacts()");
+  app.run(`openFactDeletion(${JSON.stringify(fact)}, "fact-token")`);
+  app.get("#fact-deletion-reviewer").value = "reviewer";
+  app.get("#fact-deletion-notes").value = "Cannot establish business identity.";
+  app.get("#fact-deletion-confirm").value = "fact-1";
+
+  await app.run("submitFactDeletion({preventDefault() {}})");
+
+  const request = app.calls.find((call) => call.options?.method === "DELETE");
+  assert.equal(request.url, "/facts/fact-1");
+  assert.deepEqual(JSON.parse(request.options.body), {
+    reviewer: "reviewer", notes: "Cannot establish business identity.", confirm: "fact-1", expected_token: "fact-token",
+  });
+  assert.equal(app.get("#fact-deletion-dialog").open, false);
+  assert.equal(app.run("state.facts.length"), 0);
+  assert.match(app.get("#codegen-result").textContent, /Previous builders and graph snapshots are unchanged/);
+  assert.match(app.errors[0], /audit history retained/);
+});
+
+test("a stale deletion remains open and explicitly asks for a fresh review", async () => {
+  const app = harness(async () => { const error = new Error("The fact changed."); error.status = 409; throw error; });
+  app.run(`openFactDeletion(${JSON.stringify(fact)}, "old-token")`);
+  app.get("#fact-deletion-reviewer").value = "reviewer";
+  app.get("#fact-deletion-notes").value = "Cannot repair.";
+  app.get("#fact-deletion-confirm").value = fact.id;
+
+  await app.run("submitFactDeletion({preventDefault() {}})");
+
+  assert.equal(app.get("#fact-deletion-dialog").open, true);
+  assert.match(app.get("#fact-deletion-error").textContent, /recheck mappings/);
+  assert.equal(app.errors.length, 0);
+  assert.equal(app.get("#fact-deletion-form button[type=submit]").disabled, false);
+});
+
+test("deletion cannot be submitted after switching source or for a missing fact", async () => {
+  const app = harness();
+  app.run(`openFactDeletion(${JSON.stringify(fact)}, "fact-token")`);
+  app.get("#facts-source").value = "other";
+
+  await app.run("submitFactDeletion({preventDefault() {}})");
+
+  assert.equal(app.calls.length, 0);
+  app.run("state.factDeletion = null; state.facts = [];");
+  app.run(`openFactDeletion(${JSON.stringify(fact)}, "fact-token")`);
+  assert.equal(app.run("state.factDeletion"), null);
+});
+
+test("node deletion previews dependent facts and clearly states there is no cascade", () => {
+  const app = harness();
+  app.run(`state.facts.push({id:"fact-edge", kind:"edge_mapping", hypothesis:"Customer places order",
+    mapping:{from_node_type:"Customer", to_node_type:"Order"}});
+    openFactDeletion(${JSON.stringify(fact)}, "fact-token");`);
+
+  assert.match(app.get("#fact-deletion-preview").textContent, /fact-edge/);
+  assert.match(app.get("#fact-deletion-preview").textContent, /remain for separate review/);
+  assert.equal(app.calls.length, 0);
 });

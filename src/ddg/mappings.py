@@ -12,6 +12,118 @@ from .transforms import TRANSFORM_NAMES
 NULL_KEY_POLICIES = ("skip", "error")
 
 
+def identity_contract_errors(mapping: dict, others: list[dict]) -> list[str]:
+    """Require a shared semantic namespace to use the same ordered parts and normalization."""
+    namespace = mapping.get("identity_namespace")
+    if not isinstance(namespace, str) or not namespace.strip():
+        return []
+    parts = mapping.get("identity_key_parts") or mapping["key_columns"]
+    chains = mapping.get("key_transforms") or [[] for _ in mapping["key_columns"]]
+    errors = []
+    for other in others:
+        if (other.get("node_type"), other.get("identity_namespace")) != (mapping["node_type"], namespace):
+            continue
+        other_parts = other.get("identity_key_parts") or other["key_columns"]
+        other_chains = other.get("key_transforms") or [[] for _ in other["key_columns"]]
+        if parts != other_parts or chains != other_chains:
+            errors.append(
+                f"Identity namespace '{namespace}' for {mapping['node_type']} has incompatible contracts: "
+                f"ordered identity_key_parts and key_transforms must agree with {other['source_table']} "
+                f"({', '.join(other_parts)}). Review the semantic parts and normalization, or use a distinct "
+                "namespace for a different identity; source column names may differ."
+            )
+    return errors
+
+
+def node_mapping_catalog(snapshot: dict, source: str) -> dict[str, list[dict]]:
+    """Expose every active endpoint contract, retaining stable IDs across approval."""
+    result: dict[str, list[dict]] = {}
+    for fact in reversed(snapshot["facts"]):
+        if fact["kind"] == "node_mapping" and fact.get("source") == source:
+            mapping = fact["mapping"]
+            result.setdefault(mapping["node_type"], []).append({
+                **mapping, "mapping_id": fact["candidate_id"], "fact_id": fact["id"],
+                "_status": "approved", "identity_namespace": mapping.get("identity_namespace"),
+            })
+    for candidate in snapshot["pending"]:
+        if candidate["kind"] == "node_mapping" and candidate.get("scope", {}).get("source") == source:
+            mapping = candidate["mapping"]
+            result.setdefault(mapping["node_type"], []).append({
+                **mapping, "mapping_id": candidate["id"], "_status": "pending",
+                "identity_namespace": mapping.get("identity_namespace"),
+            })
+    return result
+
+
+def available_node_mappings(snapshot: dict, source: str) -> dict[str, dict]:
+    """Choose a preferred contract for offline discovery, never for graph endpoint binding."""
+    return {name: mappings[0] for name, mappings in node_mapping_catalog(snapshot, source).items()}
+
+
+def resolve_edge_endpoints(mapping: dict, catalog: dict[str, list[dict]]) -> tuple[dict[str, dict], list[str]]:
+    """Resolve and validate each endpoint against one specific node identity contract."""
+    bindings: dict[str, dict] = {}
+    errors: list[str] = []
+    for side in ("from", "to"):
+        node_type = mapping[f"{side}_node_type"]
+        options = catalog.get(node_type, [])
+        reference = mapping.get(f"{side}_mapping_id")
+        if not options:
+            errors.append(
+                f"Missing node mapping for endpoint '{node_type}': edge {mapping['edge_type']} needs an "
+                f"approved node mapping for '{node_type}' ({side} endpoint). "
+                "Approve a valid node mapping first, or leave this relationship out of this build."
+            )
+            continue
+        if reference:
+            options = [node for node in options if reference in (node.get("mapping_id"), node.get("fact_id"))]
+            if not options:
+                errors.append(
+                    f"{side}_mapping_id '{reference}' does not identify an available node mapping for '{node_type}'. "
+                    "Select an active endpoint mapping for this source; do not substitute another identity."
+                )
+                continue
+        if len(options) != 1:
+            choices = ", ".join(
+                f"{node['mapping_id']} ({node['source_table']}: {' + '.join(node['key_columns'])})"
+                for node in options
+            )
+            errors.append(
+                f"Relationship '{mapping['edge_type']}' has an ambiguous {node_type} endpoint. "
+                f"Set {side}_mapping_id to the intended identity contract: {choices}. "
+                "Review a corrected mapping, or leave this relationship out of this build."
+            )
+            continue
+        node = options[0]
+        keys = mapping[f"{side}_key_columns"]
+        if len(keys) != len(node["key_columns"]):
+            errors.append(
+                f"Relationship '{mapping['edge_type']}' cannot identify its {node_type} "
+                f"{'starting' if side == 'from' else 'ending'} node: "
+                f"{side}_key_columns supplies {len(keys)} ID part(s) ({', '.join(keys)}), "
+                f"but endpoint {node['mapping_id']} needs {len(node['key_columns'])} "
+                f"({' + '.join(node['key_columns'])}). "
+                "The relationship must supply the same ID parts in the same order. "
+                "Review a corrected mapping, or leave this relationship out of this build; "
+                "revalidating an old approval cannot repair missing ID parts."
+            )
+            continue
+        if mapping["source_table"].lower() == node["source_table"].lower():
+            transforms = mapping.get(f"{side}_key_transforms") or [[] for _ in keys]
+            node_transforms = node.get("key_transforms") or [[] for _ in node["key_columns"]]
+            own_keys = [key.lower() for key in keys]
+            node_keys = [key.lower() for key in node["key_columns"]]
+            if set(own_keys) == set(node_keys) and (own_keys != node_keys or transforms != node_transforms):
+                errors.append(
+                    f"{side}_key_columns and {side}_key_transforms must use the exact ordered key contract "
+                    f"of endpoint {node['mapping_id']} on the same table "
+                    f"({' + '.join(node['key_columns'])}); matching key arity alone is not enough."
+                )
+                continue
+        bindings[side] = node
+    return bindings, errors
+
+
 def _check_transforms(value: Any, columns: list[str], label: str, errors: list[str]) -> None:
     if value is None:
         return
@@ -41,11 +153,25 @@ def validate_node_mapping(mapping: dict, topology: Topology, adapter: SourceAdap
         errors.append(f"node_type '{node_type}' is not defined in the topology")
     if not mapping.get("source_table"):
         errors.append("source_table is required")
+    namespace = mapping.get("identity_namespace")
+    if not isinstance(namespace, str) or not namespace.strip() or namespace != namespace.strip():
+        errors.append(
+            "identity_namespace must be an explicit, non-empty semantic namespace without surrounding whitespace "
+            "(for example V21_BAN or IMEI). Review a corrected mapping; renewing an old approval cannot choose it."
+        )
     keys = mapping.get("key_columns") or []
     if not isinstance(keys, list) or not keys:
         errors.append("key_columns must be a non-empty list")
         keys = []
+    elif any(not isinstance(key, str) or not key.strip() for key in keys) or len(set(keys)) != len(keys):
+        errors.append("key_columns must contain distinct, non-empty column names")
+        keys = []
     _check_transforms(mapping.get("key_transforms"), keys, "key_transforms", errors)
+    parts = mapping.get("identity_key_parts", keys)
+    if (not isinstance(parts, list) or len(parts) != len(keys)
+            or any(not isinstance(part, str) or not part.strip() or part != part.strip() for part in parts)
+            or len(set(parts)) != len(parts)):
+        errors.append("identity_key_parts must contain one distinct, non-empty semantic name per ordered key column")
     props = mapping.get("properties") or {}
     if not isinstance(props, dict):
         errors.append("properties must be an object mapping property name to source column")
@@ -71,10 +197,16 @@ def validate_edge_mapping(mapping: dict, topology: Topology, adapter: SourceAdap
         errors.append("source_table is required")
     from_keys = mapping.get("from_key_columns") or []
     to_keys = mapping.get("to_key_columns") or []
-    if not from_keys:
-        errors.append("from_key_columns must be a non-empty list")
-    if not to_keys:
-        errors.append("to_key_columns must be a non-empty list")
+    for side, keys in (("from", from_keys), ("to", to_keys)):
+        if not isinstance(keys, list) or not keys or any(not isinstance(key, str) or not key.strip() for key in keys):
+            errors.append(f"{side}_key_columns must be a non-empty list of column names")
+            if side == "from":
+                from_keys = []
+            else:
+                to_keys = []
+        reference = mapping.get(f"{side}_mapping_id")
+        if reference is not None and (not isinstance(reference, str) or not reference.strip()):
+            errors.append(f"{side}_mapping_id must be a non-empty mapping ID")
     _check_transforms(mapping.get("from_key_transforms"), from_keys, "from_key_transforms", errors)
     _check_transforms(mapping.get("to_key_transforms"), to_keys, "to_key_transforms", errors)
     props = mapping.get("properties") or {}
@@ -96,6 +228,8 @@ def normalize_node_mapping(mapping: dict, topology: Topology) -> dict:
         "node_type": mapping["node_type"],
         "source_table": mapping["source_table"],
         "key_columns": keys,
+        "identity_namespace": mapping["identity_namespace"],
+        "identity_key_parts": list(mapping.get("identity_key_parts", keys)),
         "key_transforms": mapping.get("key_transforms") or [[] for _ in keys],
         "properties": dict(mapping.get("properties") or {}),
         "null_key_policy": mapping.get("null_key_policy", "skip"),
@@ -118,6 +252,8 @@ def normalize_edge_mapping(mapping: dict, topology: Topology) -> dict:
         "properties": dict(mapping.get("properties") or {}),
         "null_key_policy": mapping.get("null_key_policy", "skip"),
         "dedupe": bool(mapping.get("dedupe", True)),
+        **{f"{side}_mapping_id": mapping[f"{side}_mapping_id"]
+           for side in ("from", "to") if mapping.get(f"{side}_mapping_id")},
     }
 
 
@@ -172,8 +308,6 @@ def build_spec(
     allow_stale: bool = False,
 ) -> BuildSpec:
     spec = BuildSpec(source=source, topology_version=topology.version)
-    key_arity: dict[str, int] = {}
-    key_columns: dict[str, list[str]] = {}
     for fact in facts:
         if fact.get("source") != source or fact.get("kind") not in ("node_mapping", "edge_mapping"):
             continue
@@ -190,14 +324,7 @@ def build_spec(
                 continue
             node = normalize_node_mapping(mapping, topology)
             node["fact_id"] = fact["id"]
-            arity = len(node["key_columns"])
-            if key_arity.setdefault(node["node_type"], arity) != arity:
-                spec.add_fact_errors(fact["id"], [
-                    f"This {node['node_type']} mapping uses {arity} ID parts, but another approved mapping "
-                    f"uses {key_arity[node['node_type']]}. Review the entity identity before including both."
-                ])
-                continue
-            key_columns.setdefault(node["node_type"], node["key_columns"])
+            node["mapping_id"] = fact["candidate_id"]
             spec.nodes.append(node)
         else:
             problems = validate_edge_mapping(mapping, topology, adapter)
@@ -213,27 +340,19 @@ def build_spec(
         })
 
     mapped_types = {n["node_type"] for n in spec.nodes}
+    catalog: dict[str, list[dict]] = {}
+    for node in spec.nodes:
+        problems = identity_contract_errors(node, [other for other in spec.nodes if other is not node])
+        if problems:
+            spec.add_fact_errors(node["fact_id"], problems)
+        catalog.setdefault(node["node_type"], []).append(node)
     for edge in spec.edges:
-        for side, node_type, keys in (
-            ("from", edge["from_node_type"], edge["from_key_columns"]),
-            ("to", edge["to_node_type"], edge["to_key_columns"]),
-        ):
-            if node_type not in mapped_types:
-                spec.add_fact_errors(edge["fact_id"], [
-                    f"edge {edge['edge_type']} needs an approved node mapping for '{node_type}' ({side} endpoint). "
-                    "Approve a valid node mapping first, or leave this relationship out of this build."
-                ])
-            elif key_arity.get(node_type) != len(keys):
-                endpoint = "starting" if side == "from" else "ending"
-                spec.add_fact_errors(edge["fact_id"], [
-                    f"Relationship '{edge['edge_type']}' cannot identify its {node_type} {endpoint} node: "
-                    f"{side}_key_columns supplies {len(keys)} ID part(s) ({', '.join(keys)}), "
-                    f"but approved {node_type} IDs need {key_arity[node_type]} "
-                    f"(for example {' + '.join(key_columns[node_type])}). "
-                    "The relationship must supply the same ID parts in the same order. "
-                    "Review a corrected mapping, or leave this relationship out of this build; "
-                    "revalidating an old approval cannot repair missing ID parts."
-                ])
+        bindings, problems = resolve_edge_endpoints(edge, catalog)
+        if problems:
+            spec.add_fact_errors(edge["fact_id"], problems)
+        for side, node in bindings.items():
+            edge[f"{side}_mapping_id"] = node["mapping_id"]
+            edge[f"{side}_identity_namespace"] = node["identity_namespace"]
     if not spec.nodes:
         spec.errors.append(f"No approved node mappings for source '{source}'. Approve candidates before generating code.")
     for node_type in topology.node_types:

@@ -1,0 +1,16 @@
+The run objective is TOPOLOGY VALIDATION, not fitting data to an unquestioned specification.
+Treat the current topology as hypotheses. Test keys, nullability, properties, relationship
+endpoints, cardinalities and constraints against source evidence, including already approved
+or pending mappings. Existing mapping coverage is NOT validation coverage.
+Use record_topology_finding to persist supported, mismatch, or inconclusive findings.
+Cite evidence ids and state exactly which assumption was tested and the recommended edit.
+For missing entities or relationships use node:ProposedName or edge:PROPOSED_NAME and aspect
+'addition'; recommend additions only with source evidence and confirmed business meaning.
+Distinguish source quality, sample limitations, and naming ambiguity from topology mistakes.
+Absence of overlap, especially in independent samples, never proves a relationship invalid.
+Do not narrow many-side cardinality merely because a sample contains unique values.
+Never edit topology or approve facts. Recommendations are advisory and require human review.
+Do not declare DONE until each in-scope node or edge has a persisted finding, or explicitly
+record why it could not be tested. Include untested constraints and remaining gaps in DETAILS.
+If discovery scope is EDGES ONLY, all validation and addition recommendations must be edge-only.
+Existing node mappings are endpoint context, not node-discovery or node-validation targets.

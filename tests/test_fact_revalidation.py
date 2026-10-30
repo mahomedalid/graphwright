@@ -13,11 +13,14 @@ def client(project):
 
 
 def _approve(store, kind="node_mapping", mapping=None, **extra):
+    mapping = mapping or {
+        "node_type": "Customer", "source_table": "CUST_MASTER", "key_columns": ["cust_id"],
+    }
+    if kind == "node_mapping":
+        mapping = {"identity_namespace": f"{mapping['source_table']}_ID", **mapping}
     candidate = store.add_candidate({
         "kind": kind, "hypothesis": "Mapping for review",
-        "mapping": mapping or {
-            "node_type": "Customer", "source_table": "CUST_MASTER", "key_columns": ["cust_id"],
-        },
+        "mapping": mapping,
         "scope": {"source": "retail"}, "topology_version": "old-topology",
         "evidence": [{"id": "ev-original"}], **extra,
     })
@@ -83,6 +86,23 @@ def test_given_missing_source_column_when_revalidating_then_approval_is_not_rene
     assert report["validations"][fact["id"]]["can_revalidate"] is False
     assert response.status_code == 422
     assert store.get_fact(fact["id"]) == fact
+
+
+def test_given_legacy_approval_without_namespace_when_revalidating_then_requires_corrected_mapping(client, store):
+    fact = _approve(store, mapping={
+        "node_type": "Customer", "source_table": "CUST_MASTER", "key_columns": ["cust_id"],
+        "identity_namespace": None,
+    })
+    before = store.list_facts()
+    report = client.get("/api/w/retail/facts/revalidation", params={"source": "retail"}).json()
+
+    response = client.post(f"/api/w/retail/facts/{fact['id']}/revalidate", json=_payload(client, fact))
+    generated = client.post("/api/w/retail/codegen", json={"source": "retail", "allow_stale": True})
+
+    assert not report["validations"][fact["id"]]["can_revalidate"]
+    assert "identity_namespace" in " ".join(report["validations"][fact["id"]]["errors"])
+    assert response.status_code == generated.status_code == 422
+    assert store.list_facts() == before
 
 
 def test_given_changed_schema_when_reviewed_then_updates_fingerprints_and_keeps_history(client, store):
@@ -157,6 +177,30 @@ def test_given_endpoint_id_mismatch_when_revalidating_then_explains_required_par
     assert "cust_ref" in message and "cust_id + email_addr" in message
     assert "leave this relationship out of this build" in message
     assert store.get_fact(edge["id"]) == edge
+
+
+def test_given_ambiguous_legacy_endpoint_when_checking_facts_then_flags_without_rewriting(client, store):
+    _approve(store)
+    _approve(store, mapping={
+        "node_type": "Customer", "source_table": "tbl_ord_hdr", "key_columns": ["cust_ref", "order_no"],
+    })
+    _approve(store, mapping={
+        "node_type": "Order", "source_table": "tbl_ord_hdr", "key_columns": ["order_no"],
+    })
+    edge = _approve(store, "edge_mapping", mapping={
+        "edge_type": "PLACED", "source_table": "tbl_ord_hdr",
+        "from_key_columns": ["cust_ref"], "to_key_columns": ["order_no"],
+    })
+    before = store.list_facts()
+
+    report = client.get("/api/w/retail/facts/revalidation", params={"source": "retail"}).json()
+    validation = report["validations"][edge["id"]]
+    response = client.post(f"/api/w/retail/facts/{edge['id']}/revalidate", json=_payload(client, edge))
+
+    assert not validation["can_revalidate"]
+    assert "from_mapping_id" in " ".join(validation["errors"])
+    assert response.status_code == 422
+    assert store.list_facts() == before
 
 
 def test_given_bad_relationship_when_explicitly_excluded_then_builds_remaining_facts(client, store, mismatched_facts):

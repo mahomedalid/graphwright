@@ -284,7 +284,7 @@ class Store:
         facts = []
         for path in sorted(self.settings.approved_dir.glob("fact-*.json")):
             data = read_json(path)
-            if data and (source is None or data.get("source") == source):
+            if data and not data.get("deletion") and (source is None or data.get("source") == source):
                 facts.append(data)
         facts.sort(key=lambda f: f.get("approved_at", ""))
         return facts
@@ -293,7 +293,59 @@ class Store:
         """Read an approved fact without allowing paths outside the fact directory."""
         if not fact_id.startswith("fact-") or not fact_id.replace("-", "").isalnum():
             raise ValueError("Invalid fact id")
-        return read_json(self.settings.approved_dir / f"{fact_id}.json")
+        fact = read_json(self.settings.approved_dir / f"{fact_id}.json")
+        return fact if fact and not fact.get("deletion") else None
+
+    def delete_fact(
+        self, fact_id: str, *, reviewer: str, notes: str, expected_token: str, confirm: str,
+    ) -> dict:
+        """Remove a fact from active knowledge, retaining its data and revocation audit."""
+        if confirm != fact_id:
+            raise ValueError("Type the fact id to confirm deletion")
+        if not reviewer.strip() or not notes.strip():
+            raise ValueError("Reviewer and deletion reason are required")
+        with file_lock(self._lock_path):
+            fact = self.get_fact(fact_id)
+            if fact is None:
+                raise KeyError(fact_id)
+            if short_hash(fact) != expected_token:
+                raise ConflictError("The fact changed during review. Reload the facts and review deletion again.")
+            node_type = (fact.get("mapping") or {}).get("node_type") if fact["kind"] == "node_mapping" else None
+            dependents = [
+                other["id"] for other in self.list_facts(fact["source"])
+                if node_type and other["kind"] == "edge_mapping"
+                and node_type in (
+                    (other.get("mapping") or {}).get("from_node_type"),
+                    (other.get("mapping") or {}).get("to_node_type"),
+                )
+            ]
+            fact["deletion"] = {
+                "at": utcnow(), "reviewer": reviewer.strip(), "notes": notes.strip(),
+                "previous_token": expected_token, "dependent_fact_ids": dependents,
+            }
+            # The tombstone commits deletion; reconcile finishes candidate revocation after a crash.
+            atomic_write_json(self.settings.approved_dir / f"{fact_id}.json", fact)
+            self._revoke_fact_candidate(fact)
+            return {"id": fact_id, "deleted": True, "deletion": fact["deletion"],
+                    "dependent_fact_ids": dependents}
+
+    def _revoke_fact_candidate(self, fact: dict) -> bool:
+        candidate = self.get_candidate(fact["candidate_id"])
+        if candidate is None or any(
+            decision.get("deleted_fact_id") == fact["id"] for decision in candidate.get("decisions", [])
+        ):
+            return False
+        deletion = fact["deletion"]
+        candidate["decisions"].append({
+            "decision": "reject", "reviewer": deletion["reviewer"],
+            "notes": f"Fact deleted: {deletion['notes']}", "observations": "",
+            "at": deletion["at"], "candidate_version": candidate["version"], "deleted_fact_id": fact["id"],
+        })
+        candidate["status"] = "rejected"
+        candidate["version"] += 1
+        candidate["updated_at"] = deletion["at"]
+        atomic_write_json(self._candidate_path(candidate["id"]), candidate)
+        return True
 
     def revalidate_fact(
         self, fact_id: str, *, topology_version: str, schema_fingerprints: dict[str, str],
@@ -326,6 +378,10 @@ class Store:
         """Repair candidates whose fact was written but whose status update was interrupted."""
         repaired = []
         with file_lock(self._lock_path):
+            for path in sorted(self.settings.approved_dir.glob("fact-*.json")):
+                fact = read_json(path)
+                if fact and fact.get("deletion") and self._revoke_fact_candidate(fact):
+                    repaired.append(fact["candidate_id"])
             for fact in self.list_facts():
                 candidate = self.get_candidate(fact["candidate_id"])
                 if candidate and candidate["status"] == "pending" and candidate["version"] == fact["candidate_version"]:

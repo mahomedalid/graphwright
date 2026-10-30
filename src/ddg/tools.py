@@ -15,9 +15,12 @@ from typing import Any
 
 from .adapters.base import ReadOnlyViolation, SourceAdapter, UnknownObject, value_shape
 from .confidence import TIER_SCORE, TIERS, assess
-from .config import MODES, Settings
+from .config import DISCOVERY_SCOPES, MODES, Settings
 from .control import RunControl, StopRun
-from .mappings import validate_edge_mapping, validate_node_mapping
+from .mappings import (
+    identity_contract_errors, node_mapping_catalog, resolve_edge_endpoints,
+    validate_edge_mapping, validate_node_mapping,
+)
 from .privacy import PrivacyGuard
 from .store import ProposalRejected, Store, new_id, utcnow
 from .topology import Topology
@@ -43,9 +46,13 @@ class DiscoveryTools:
         evidence_index: dict[str, dict] | None = None,
         mode: str = "conservative",
         independent_samples: bool = False,
+        validate_topology: bool = False,
+        discovery_scope: str = "all",
     ):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {', '.join(MODES)}")
+        if discovery_scope not in DISCOVERY_SCOPES:
+            raise ValueError(f"discovery_scope must be one of {', '.join(DISCOVERY_SCOPES)}")
         self.settings = settings
         self.store = store
         self.adapter = adapter
@@ -54,6 +61,9 @@ class DiscoveryTools:
         self.run_id = run_id
         self.mode = mode
         self.independent_samples = independent_samples
+        self.validate_topology = validate_topology
+        self.discovery_scope = discovery_scope
+        self.topology_findings: list[dict] = []
         self.privacy = PrivacyGuard(settings.sampling)
         self.iteration = 0
         self.evidence_index: dict[str, dict] = dict(evidence_index or {})
@@ -491,6 +501,52 @@ class DiscoveryTools:
 
         return self._call("record_note", {"note": note[:200]}, run)
 
+    def record_topology_finding(
+        self, element: str, aspect: str, status: str, finding: str,
+        recommendation: str, evidence_ids: list[str], limitations: list[str] | None = None,
+    ) -> dict:
+        """Record an evidence-backed advisory finding, never a fact or a topology edit."""
+        def run():
+            if not self.validate_topology:
+                raise ToolError("Topology validation is not enabled for this run")
+            if self.discovery_scope == "edges" and not element.startswith("edge:"):
+                raise ToolError("Edges-only runs can record topology findings only for relationships")
+            if status not in ("supported", "mismatch", "inconclusive"):
+                raise ToolError("status must be supported, mismatch, or inconclusive")
+            if not all(isinstance(value, str) and value.strip() for value in (element, aspect, finding)):
+                raise ToolError("element, aspect, and finding are required text")
+            if not element.startswith(("node:", "edge:", "constraint:")):
+                raise ToolError("element must start with node:, edge:, or constraint:")
+            if status != "supported" and not recommendation.strip():
+                raise ToolError("A mismatch or inconclusive finding requires a recommendation")
+            if not evidence_ids:
+                raise ToolError("Topology findings must cite source evidence")
+            evidence = []
+            for eid in evidence_ids:
+                ev = self.evidence_index.get(eid)
+                if ev is None or ev.get("source") != self.adapter.name:
+                    raise ToolError(f"Unknown evidence id '{eid}' for this source")
+                evidence.append(ev)
+            caveats = list(limitations or [])
+            if any(ev.get("scope") != "full" for ev in evidence):
+                caveats.append("Evidence includes bounded samples; this is not full-source proof.")
+            if self.independent_samples:
+                caveats.append("Tables contain independent samples; missing overlap does not disprove a relationship.")
+            record = {
+                "element": element, "aspect": aspect, "status": status, "finding": finding,
+                "recommendation": recommendation, "evidence_ids": list(evidence_ids),
+                "evidence": evidence,
+                "limitations": caveats, "topology_version": self.topology.version,
+                "source": self.adapter.name, "run_id": self.run_id, "iteration": self.iteration,
+            }
+            self.topology_findings[:] = [
+                f for f in self.topology_findings if (f["element"], f["aspect"]) != (element, aspect)
+            ]
+            self.topology_findings.append(record)
+            return {"recorded": True, **record}
+
+        return self._call("record_topology_finding", {"element": element, "aspect": aspect}, run)
+
     def propose_candidate(
         self,
         kind: str,
@@ -509,6 +565,8 @@ class DiscoveryTools:
         def run():
             if kind not in CANDIDATE_KINDS:
                 raise ToolError(f"kind must be one of {CANDIDATE_KINDS}")
+            if self.discovery_scope == "edges" and kind != "edge_mapping":
+                raise ToolError("Edges-only discovery accepts only edge_mapping proposals; node mappings and annotations are disabled")
             if not hypothesis.strip():
                 raise ToolError("hypothesis is required")
             evidence = []
@@ -524,6 +582,8 @@ class DiscoveryTools:
             if kind == "node_mapping":
                 errors = validate_node_mapping(mapping or {}, self.topology, self.adapter)
                 if not errors:
+                    catalog = node_mapping_catalog(self.store.review_snapshot(), self.adapter.name)
+                    errors.extend(identity_contract_errors(mapping, catalog.get(mapping["node_type"], [])))
                     tables.add(self.adapter.resolve_table(mapping["source_table"]))
             elif kind == "edge_mapping":
                 errors = validate_edge_mapping(mapping or {}, self.topology, self.adapter)
@@ -543,6 +603,24 @@ class DiscoveryTools:
                     if ev["args"].get(key):
                         tables.add(ev["args"][key])
             lims = list(limitations or [])
+            if kind == "edge_mapping":
+                catalog = node_mapping_catalog(self.store.review_snapshot(), self.adapter.name)
+                bindings, problems = resolve_edge_endpoints(mapping, catalog)
+                if problems:
+                    raise ToolError("Invalid endpoint identity: " + "; ".join(problems))
+                for side, node in bindings.items():
+                    endpoint = node["node_type"]
+                    problems = validate_node_mapping(node, self.topology, self.adapter)
+                    if problems:
+                        raise ToolError(f"Endpoint '{endpoint}' mapping needs correction: {'; '.join(problems)}")
+                    conflicts = identity_contract_errors(
+                        node, [other for other in catalog.get(endpoint, []) if other is not node],
+                    )
+                    if conflicts:
+                        raise ToolError("Invalid endpoint identity: " + "; ".join(conflicts))
+                    mapping[f"{side}_mapping_id"] = node["mapping_id"]
+                    if node["_status"] == "pending":
+                        lims.append(f"Depends on the {endpoint} node mapping, which is still pending SME review.")
             if any(ev["scope"] == "sample" for ev in evidence):
                 lims.append("Some supporting evidence is from bounded samples, not full-data checks.")
             lims.append("Model or heuristic confidence is not proof of business meaning; SME validation required.")
@@ -579,6 +657,7 @@ class DiscoveryTools:
                 "confidence_reasons": assessment["reasons"],
                 "evidence_tier": assessment["evidence_tier"],
                 "discovery_mode": self.mode,
+                "discovery_scope": self.discovery_scope,
                 "source_refs": sorted(f"{self.adapter.name}:{t}" for t in tables),
                 "scope": {"source": self.adapter.name, "tables": sorted(tables)},
                 "schema_fingerprints": {t: self.adapter.schema_fingerprint(t) for t in sorted(tables)},

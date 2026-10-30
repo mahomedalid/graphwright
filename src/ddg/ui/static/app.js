@@ -49,6 +49,7 @@ async function api(path, options = {}) {
     const entered = prompt("API token required");
     if (entered) { localStorage.setItem("ddg-token", entered); return api(path, options); }
   }
+  if (response.ok && response.headers.get("content-type")?.includes("application/zip")) return response.blob();
   const body = response.headers.get("content-type")?.includes("json") ? await response.json() : await response.text();
   if (!response.ok) {
     const err = new Error(typeof body === "object" ? (body.detail || JSON.stringify(body)) : body);
@@ -62,7 +63,7 @@ async function api(path, options = {}) {
 const state = {
   status: null, ws: null, wsStatus: null, workspaces: [], selectedRun: null, selectedCandidate: null, cy: null, graph: null,
   graphEpoch: 0, graphSearchRequest: 0, graphViewRequest: 0, graphCenter: null, graphNodes: new Map(), graphEdges: new Map(),
-  facts: [], factsLoading: false, factsRequest: 0, factsSourceKey: null, factExclusions: new Set(), factReview: null,
+  facts: [], factsLoading: false, factsRequest: 0, factsSourceKey: null, factExclusions: new Set(), factReview: null, factDeletion: null,
 };
 
 function wsApi(path, options) {
@@ -105,9 +106,12 @@ async function switchWorkspace(name, { persist = true } = {}) {
   state.selectedCandidate = null;
   state.factsRequest++;
   state.factsSourceKey = null;
+  $("#table-bindings").value = "";
   state.factExclusions.clear();
   state.factReview = null;
+  state.factDeletion = null;
   if ($("#fact-revalidation-dialog").open) $("#fact-revalidation-dialog").close();
+  if ($("#fact-deletion-dialog").open) $("#fact-deletion-dialog").close();
   resetGraphExplorer();
   $("#run-detail").classList.add("hidden");
   clear($("#candidate-detail")).append(h("p", { className: "muted" }, "Select a candidate to review its evidence."));
@@ -303,7 +307,9 @@ async function loadRuns() {
         h("td", {}, h("button", { className: "link", onclick: () => selectRun(run.id) }, run.id)),
         h("td", {}, pill(run.status)),
         h("td", {}, run.source),
-        h("td", {}, run.planner || "", run.mode ? h("div", { className: "small muted" }, run.mode) : null),
+        h("td", {}, run.planner || "", run.mode ? h("div", { className: "small muted" }, run.mode) : null,
+          run.discovery_scope === "edges" ? h("div", { className: "small" }, "Relationships only") : null,
+          run.validate_topology ? h("div", { className: "small" }, "Topology validation") : null),
         h("td", {}, run.iterations),
         h("td", {}, run.candidates),
         h("td", {}, run.termination_reason || ""),
@@ -353,7 +359,17 @@ async function selectRun(runId, quiet = false) {
     h("dl", { className: "kv" },
       h("dt", {}, "Source"), h("dd", {}, run.source),
       h("dt", {}, "Planner"), h("dd", {}, (run.planner || "") + (run.mode ? ` · ${run.mode} mode` : "")),
+      Array.isArray(run.context_files) ? [
+        h("dt", {}, "Context references loaded"), h("dd", {},
+          run.context_files.length
+            ? h("ul", {}, run.context_files.map((path) => h("li", {}, h("code", {}, path))))
+            : "No additional Markdown references found.",
+          h("p", { className: "small muted" },
+            "Loaded once at run start. Only the Foundry planner interprets these unverified references; offline planners do not.")),
+      ] : null,
       h("dt", {}, "Topology version"), h("dd", {}, run.topology_version || ""),
+      h("dt", {}, "Objective"), h("dd", {}, run.validate_topology ? "Validate topology and recommend edits" : "Discover mappings"),
+      h("dt", {}, "Discovery target"), h("dd", {}, run.discovery_scope === "edges" ? "Relationships only; existing node mappings" : "Nodes and relationships"),
       h("dt", {}, "Resumed from"), h("dd", {}, run.resumed_from || "—"),
       h("dt", {}, "Limits"), h("dd", {}, Object.entries(run.limits || {}).map(([k, v]) => `${k}=${v}`).join(", ")),
       h("dt", {}, "Usage"), h("dd", {}, `${u.tool_calls ?? 0} tool calls · ${u.queries ?? 0} queries · ${u.model_calls ?? 0} model calls · ${u.input_tokens ?? 0}/${u.output_tokens ?? 0} tokens · $${(u.cost_usd ?? 0).toFixed(4)}`),
@@ -362,6 +378,7 @@ async function selectRun(runId, quiet = false) {
         `${run.events[run.events.length - 1].type} · ${fmtTime(run.events[run.events.length - 1].at)}`)] : null,
     )),
     run.error ? h("p", { className: "error" }, run.error) : null,
+    run.validate_topology ? topologyFindingsView(run) : null,
     h("h3", {}, `Steps (${(run.iterations || []).length})`),
     (run.iterations || []).length
       ? h("ol", { className: "iterations" }, run.iterations.map((it) => iterationView(it, openSet)))
@@ -370,6 +387,27 @@ async function selectRun(runId, quiet = false) {
       h("div", { className: "table-wrap" }, h("table", {}, h("tbody", {}, eventRows)))),
   );
   if (!quiet) panel.scrollIntoView({ behavior: "smooth" });
+}
+
+function topologyFindingsView(run) {
+  const findings = run.topology_findings || [];
+  const tested = new Set(findings.map((finding) => finding.element));
+  const untested = (run.validation_targets || []).filter((target) => !tested.has(target));
+  return h("section", { className: "topology-findings" },
+    h("h3", {}, `Topology validation (${findings.length} findings)`),
+    h("p", { className: "muted small" }, "Advisory only. Review the evidence and business meaning before editing topology. Supported checks do not prove the entire topology is valid."),
+    untested.length ? h("p", { className: "muted" }, `Not yet tested: ${untested.join("; ")}`) : null,
+    !findings.length ? h("p", {}, "No validation findings recorded yet. A stopped or budget-limited run may be incomplete.") : null,
+    findings.map((finding) => h("article", { className: "card" },
+      h("h4", {}, `${finding.element} / ${finding.aspect} `, pill(finding.status)),
+      h("p", {}, finding.finding),
+      finding.recommendation ? h("p", {}, `Recommendation: ${finding.recommendation}`) : null,
+      (finding.limitations || []).length ? h("ul", {}, finding.limitations.map((text) => h("li", {}, text))) : null,
+      h("p", { className: "small muted" }, `Source: ${finding.source} · Topology: ${finding.topology_version}`),
+      h("details", {}, h("summary", {}, `Evidence (${(finding.evidence_ids || []).length})`),
+        (finding.evidence || []).map(evidenceView)),
+    )),
+  );
 }
 
 async function cancelRun(runId) {
@@ -390,7 +428,7 @@ async function startRun(event) {
   const limits = {};
   for (const key of ["max_minutes", "max_iterations", "max_cost_usd"]) if (form.get(key)) limits[key] = Number(form.get(key));
   try {
-    const run = await wsApi("/runs", { method: "POST", body: JSON.stringify({ source: form.get("source"), planner: form.get("planner") || null, mode: form.get("mode") || null, limits }) });
+    const run = await wsApi("/runs", { method: "POST", body: JSON.stringify({ source: form.get("source"), planner: form.get("planner") || null, mode: form.get("mode") || null, validate_topology: form.has("validate_topology"), discovery_scope: form.get("discovery_scope") || "all", limits }) });
     toast(`Started ${run.id}`);
     loadRuns(); selectRun(run.id);
   } catch (e) { toast(e.message, true); }
@@ -508,10 +546,13 @@ async function loadFacts() {
   const request = ++state.factsRequest;
   const sourceKey = `${workspace}:${source}`;
   if (state.factsSourceKey !== sourceKey) {
+    if (state.factsSourceKey !== null) $("#table-bindings").value = "";
     state.factsSourceKey = sourceKey;
     state.factExclusions.clear();
     state.factReview = null;
+    state.factDeletion = null;
     $("#fact-revalidation-dialog").close();
+    $("#fact-deletion-dialog").close();
     clear($("#codegen-result"));
   }
   const current = () => state.ws === workspace && request === state.factsRequest && $("#facts-source").value === source;
@@ -577,7 +618,9 @@ async function loadFacts() {
         f.notes ? h("p", { className: "small muted" }, f.notes) : null),
       h("td", { className: "small" }, `${f.approved_by} · ${fmtTime(f.approved_at)}`,
         lastReview ? h("p", {}, `Revalidated by ${lastReview.reviewer} · ${fmtTime(lastReview.at)}`) : null),
-      h("td", {}, review, check.errors.length ? h("p", { className: "small" },
+      h("td", {}, review,
+        h("button", { className: "reject", onclick: () => openFactDeletion(f, check.token) }, "Delete fact"),
+        check.errors.length ? h("p", { className: "small" },
         "A new approval cannot fix this mapping. Leave it out of this build or review a corrected mapping.") : null)));
   }
   if (!facts.length) tbody.append(h("tr", {}, h("td", { colspan: 5, className: "muted" }, "No approved facts yet.")));
@@ -591,14 +634,52 @@ async function loadFacts() {
   const list = clear($("#generated-list"));
   for (const g of generated) list.append(h("li", {}, h("code", {}, g.builder), h("div", { className: "small muted" },
     `${fmtTime(g.generated_at)} · ${g.source} · ${g.facts.length} facts · ${g.excluded_fact_ids?.length || 0} left out`),
+    g.target === "databricks-notebooks" && g.warnings?.length
+      ? h("ul", { className: "warn" }, g.warnings.map((warning) => h("li", {}, warning))) : null,
     builderCommands(g)));
 }
 
 function builderCommands(builder) {
+  if (builder.target === "databricks-notebooks") {
+    const workspace = state.ws;
+    const status = h("p", { className: "small", role: "status" });
+    const button = h("button", { onclick: async () => {
+      button.disabled = true;
+      status.textContent = "";
+      try {
+        await downloadNotebookPackage(builder, workspace);
+        status.textContent = "Package downloaded. Extract the ZIP, then import the four Python source notebooks into the same Databricks folder. Review bindings and configuration before running manually.";
+      } catch (e) {
+        status.textContent = `Download failed: ${e.message}. Retry Download notebook ZIP; if the package is missing, generate it again in its original workspace.`;
+      } finally { button.disabled = false; }
+    } }, "Download notebook ZIP");
+    return h("div", {}, button, status,
+      h("details", {}, h("summary", {}, "Resolved source bindings"), json(builder.source_bindings || {})));
+  }
   const commands = builder.suggested_commands || { json: builder.suggested_command };
   const labels = { json: "JSON snapshot", sqlite: "SQLite graph database", cypher: "Neo4j Cypher import" };
   return h("div", {}, Object.entries(commands).map(([format, command]) =>
     h("details", {}, h("summary", {}, labels[format] || format), h("pre", {}, command))));
+}
+
+async function downloadNotebookPackage(builder, workspace) {
+  const blob = await api(`/api/w/${encodeURIComponent(workspace)}/codegen/${encodeURIComponent(builder.builder)}/download`);
+  const url = URL.createObjectURL(blob);
+  const link = h("a", { href: url, download: builder.builder });
+  document.body.append(link);
+  try { link.click(); }
+  finally {
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+}
+
+function updateCodegenTarget() {
+  const notebooks = $("#codegen-target").value === "databricks-notebooks";
+  $("#notebook-options").classList.toggle("hidden", !notebooks);
+  $("#allow-stale").disabled = notebooks;
+  $("#generate-btn").textContent = notebooks ? "Generate notebook package" : "Generate graph builder code";
+  clear($("#codegen-result"));
 }
 
 function updateFactSelection(changed = false) {
@@ -610,6 +691,8 @@ function updateFactSelection(changed = false) {
 
 function openFactRevalidation(fact, check, topologyVersion) {
   if (state.factsLoading || !state.facts.some((f) => f.id === fact.id) || !check.can_revalidate) return;
+  state.factDeletion = null;
+  $("#fact-deletion-dialog").close();
   state.factReview = { fact, check, topologyVersion, workspace: state.ws, source: $("#facts-source").value };
   $("#fact-revalidation-form").reset();
   $("#fact-revalidation-reviewer").value = $("#reviewer").value || localStorage.getItem("ddg-reviewer") || "";
@@ -650,27 +733,100 @@ async function submitFactRevalidation(event) {
   } finally { button.disabled = false; }
 }
 
+function openFactDeletion(fact, token) {
+  if (state.factsLoading || !state.facts.some((current) => current.id === fact.id)) return;
+  state.factReview = null;
+  $("#fact-revalidation-dialog").close();
+  state.factDeletion = {fact, token, workspace: state.ws, source: $("#facts-source").value};
+  $("#fact-deletion-form").reset();
+  $("#fact-deletion-reviewer").value = $("#reviewer").value || localStorage.getItem("ddg-reviewer") || "";
+  $("#fact-deletion-error").textContent = "";
+  $("#fact-deletion-confirm").placeholder = fact.id;
+  const preview = clear($("#fact-deletion-preview"));
+  appendAll(preview, h("h3", {}, fact.hypothesis), h("p", {}, fact.id), mappingTable(fact.mapping));
+  if (fact.kind === "node_mapping") {
+    const nodeType = fact.mapping.node_type;
+    const dependents = state.facts.filter((other) => other.kind === "edge_mapping"
+      && [other.mapping?.from_node_type, other.mapping?.to_node_type].includes(nodeType));
+    appendAll(preview, h("p", {className: "warn"}, "Deleting this node fact can invalidate relationship mappings. They will remain for separate review."),
+      dependents.length ? h("ul", {}, dependents.map((other) => h("li", {}, `${other.id}: ${other.hypothesis}`))) : null);
+  }
+  $("#fact-deletion-dialog").showModal();
+}
+
+async function submitFactDeletion(event) {
+  event.preventDefault();
+  const review = state.factDeletion;
+  if (!review || review.workspace !== state.ws || review.source !== $("#facts-source").value || state.factsLoading) return;
+  const reviewer = $("#fact-deletion-reviewer").value.trim();
+  const notes = $("#fact-deletion-notes").value.trim();
+  const confirm = $("#fact-deletion-confirm").value.trim();
+  if (!reviewer || !notes || confirm !== review.fact.id) {
+    $("#fact-deletion-error").textContent = "Enter your name, a deletion reason, and the exact fact ID to confirm.";
+    return;
+  }
+  const button = $("#fact-deletion-form button[type=submit]");
+  button.disabled = true;
+  $("#fact-deletion-error").textContent = "";
+  try {
+    const result = await wsApi(`/facts/${encodeURIComponent(review.fact.id)}`, {
+      method: "DELETE", body: JSON.stringify({reviewer, notes, confirm, expected_token: review.token}),
+    });
+    if (review !== state.factDeletion || review.workspace !== state.ws || review.source !== $("#facts-source").value) return;
+    localStorage.setItem("ddg-reviewer", reviewer);
+    state.factDeletion = null;
+    $("#fact-deletion-dialog").close();
+    clear($("#codegen-result")).append(h("p", {className: "warn"},
+      "Fact deleted. Previous builders and graph snapshots are unchanged; generate and review a new builder."));
+    toast(result.dependent_fact_ids?.length
+      ? `Fact deleted. Review ${result.dependent_fact_ids.length} dependent relationship facts.`
+      : "Fact deleted; audit history retained.");
+    await loadFacts();
+  } catch (e) {
+    if (review !== state.factDeletion || review.workspace !== state.ws) return;
+    $("#fact-deletion-error").textContent = e.status === 409
+      ? `${e.message} Cancel, recheck mappings, and review deletion again.` : e.message;
+  } finally { button.disabled = false; }
+}
+
 async function generateCode() {
   if (state.factsLoading) { toast("Wait for the selected source's mappings to finish loading.", true); return; }
   const out = clear($("#codegen-result"));
   const workspace = state.ws;
   const source = $("#facts-source").value;
+  const target = $("#codegen-target").value || "standalone";
   try {
-    const result = await wsApi("/codegen", { method: "POST", body: JSON.stringify({
-      source, allow_stale: $("#allow-stale").checked, exclude_fact_ids: [...state.factExclusions],
-    }) });
+    const body = {
+      source, target, allow_stale: target === "standalone" && $("#allow-stale").checked,
+      exclude_fact_ids: [...state.factExclusions],
+    };
+    if (target === "databricks-notebooks" && $("#table-bindings").value.trim()) {
+      let bindings;
+      try { bindings = JSON.parse($("#table-bindings").value); }
+      catch { throw new Error("Table bindings must be a JSON object, for example {\"sample_table\":\"catalog.schema.table\"}. Correct the JSON and retry."); }
+      if (!bindings || typeof bindings !== "object" || Array.isArray(bindings) ||
+          Object.values(bindings).some((value) => typeof value !== "string")) {
+        throw new Error("Table bindings must map sample table names to fully qualified Databricks table name strings. Correct the JSON object and retry.");
+      }
+      body.table_bindings = bindings;
+    }
+    const result = await wsApi("/codegen", { method: "POST", body: JSON.stringify(body) });
     if (workspace !== state.ws || source !== $("#facts-source").value) return;
     appendAll(out, h("p", {}, "Generated ", h("code", {}, result.path)),
       result.warnings.length ? h("ul", { className: "warn" }, result.warnings.map((w) => h("li", {}, w))) : null,
-      h("p", {}, "Review it, then run the command for your output format. You can combine output flags in one run."),
+      h("p", {}, result.target === "databricks-notebooks"
+        ? "Download and extract the ZIP, then import the four Python source notebooks into the same Databricks folder. Review bindings and configuration, then run manually. Nothing was executed."
+        : "Review it, then run the command for your output format. You can combine output flags in one run."),
       builderCommands(result),
-      h("details", {}, h("summary", {}, "View code"), h("pre", {}, result.code)));
+      result.target !== "databricks-notebooks"
+        ? h("details", {}, h("summary", {}, "View code"), h("pre", {}, result.code)) : null);
     loadFacts();
   } catch (e) {
     if (workspace !== state.ws || source !== $("#facts-source").value) return;
     const errors = e.body?.errors || [e.message];
     appendAll(out, h("p", { className: "error" }, "Selected mappings cannot be built yet:"),
       h("p", {}, "Find each fact below in Approved facts. Review old approvals, or uncheck unresolved mappings to generate a smaller graph. Nothing is excluded automatically."),
+      target === "databricks-notebooks" ? h("p", {}, "For table binding errors, supply explicit JSON overrides above using catalog.schema.table names, then retry. Notebook export does not bypass stale approvals.") : null,
       h("ul", { className: "error" }, errors.map((x) => h("li", {}, x))),
       e.body?.warnings?.length ? h("ul", { className: "warn" }, e.body.warnings.map((w) => h("li", {}, w))) : null);
   }
@@ -1247,7 +1403,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#fact-revalidation-form").addEventListener("submit", submitFactRevalidation);
   $("#fact-revalidation-cancel").addEventListener("click", () => { state.factReview = null; $("#fact-revalidation-dialog").close(); });
   $("#fact-revalidation-dialog").addEventListener("cancel", () => { state.factReview = null; });
+  $("#fact-deletion-form").addEventListener("submit", submitFactDeletion);
+  $("#fact-deletion-cancel").addEventListener("click", () => { state.factDeletion = null; $("#fact-deletion-dialog").close(); });
+  $("#fact-deletion-dialog").addEventListener("cancel", () => { state.factDeletion = null; });
   $("#generate-btn").addEventListener("click", generateCode);
+  $("#codegen-target").addEventListener("change", updateCodegenTarget);
+  $("#table-bindings").addEventListener("input", () => clear($("#codegen-result")));
   $("#graph-file").addEventListener("change", loadGraphSummary);
   $("#graph-search-form").addEventListener("submit", (e) => { e.preventDefault(); graphSearch(); });
   for (const id of ["#graph-type", "#graph-edge-type", "#graph-direction", "#graph-neighbor-type",

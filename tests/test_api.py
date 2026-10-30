@@ -97,6 +97,49 @@ def test_cancel_and_resume_endpoints(client):
     assert client.post(f"/api/w/retail/runs/{run_id}/cancel").status_code == 409
 
 
+def test_given_validation_request_when_starting_and_resuming_then_api_preserves_objective(client):
+    response = client.post("/api/w/retail/runs", json={
+        "source": "retail", "planner": "heuristic", "validate_topology": True,
+        "limits": {"max_iterations": 2},
+    })
+    assert response.status_code == 201
+    first = _wait(client, response.json()["id"])
+    assert first["topology_findings"]
+    assert client.get("/api/w/retail/runs").json()[0]["validate_topology"] is True
+
+    response = client.post(f"/api/w/retail/runs/{first['id']}/resume", json={})
+    assert response.status_code == 201
+    resumed = _wait(client, response.json()["id"])
+    assert resumed["validate_topology"] is True
+    assert client.post("/api/w/retail/runs", json={
+        "source": "retail", "planner": "profile", "validate_topology": True,
+    }).status_code == 400
+
+
+def test_given_edges_only_request_when_starting_and_resuming_then_scope_is_retained(client):
+    node_run = client.post("/api/w/retail/runs", json={
+        "source": "retail", "planner": "heuristic", "limits": {"max_iterations": 5},
+    })
+    _wait(client, node_run.json()["id"])
+    response = client.post("/api/w/retail/runs", json={
+        "source": "retail", "planner": "heuristic", "discovery_scope": "edges",
+        "limits": {"max_iterations": 2},
+    })
+    assert response.status_code == 201
+    run = _wait(client, response.json()["id"])
+    assert run["discovery_scope"] == "edges"
+    assert client.get("/api/w/retail/runs").json()[0]["discovery_scope"] == "edges"
+    conflict = client.post(f"/api/w/retail/runs/{run['id']}/resume", json={"discovery_scope": "all"})
+    assert conflict.status_code == 409
+    response = client.post(f"/api/w/retail/runs/{run['id']}/resume", json={"limits": {"max_iterations": 20}})
+    assert response.status_code == 201
+    assert _wait(client, response.json()["id"])["discovery_scope"] == "edges"
+    assert client.post("/api/w/retail/runs", json={
+        "source": "retail", "planner": "profile", "discovery_scope": "edges",
+    }).status_code == 400
+    assert client.post("/api/w/retail/runs", json={"source": "retail", "discovery_scope": "invalid"}).status_code == 422
+
+
 def test_unknown_source_and_codegen_errors(client):
     assert client.post("/api/w/retail/runs", json={"source": "nope"}).status_code == 400
     blocked = client.post("/api/w/retail/codegen", json={"source": "retail"})

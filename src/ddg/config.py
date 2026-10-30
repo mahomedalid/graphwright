@@ -33,6 +33,7 @@ WORKSPACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # conservative: only medium/high-confidence proposals are accepted.
 # exploratory: low-confidence hypotheses are accepted too, clearly tiered for SME triage.
 MODES = ("conservative", "exploratory")
+DISCOVERY_SCOPES = ("all", "edges")
 
 
 class WorkspaceError(ValueError):
