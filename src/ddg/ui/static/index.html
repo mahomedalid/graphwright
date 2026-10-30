@@ -148,7 +148,9 @@
           </select>
         </label>
         <button id="review-refresh">Refresh</button>
+        <button id="review-export" title="Export all candidates and active approved facts across all sources, statuses, and confidence tiers">Export all facts as Markdown</button>
       </div>
+      <p class="muted small">Markdown export includes all workspace candidates (pending, approved, and rejected) and active approved facts, regardless of the filters above. Evidence and review notes may contain sensitive values.</p>
       <div class="grid review">
         <div class="card list" id="candidate-list" aria-label="Candidates"></div>
         <div class="card" id="candidate-detail"><p class="muted">Select a candidate to review its evidence.</p></div>

@@ -64,6 +64,92 @@ function harness(respond) {
   return { calls, errors, get, run: (code) => vm.runInContext(code, context) };
 }
 
+test("review Markdown exports every status and complete facts with safe fences", () => {
+  const app = harness();
+  app.run(`globalThis.exportCandidates = [
+    {id: "candidate-rejected", status: "rejected", kind: "edge_mapping", scope: {source: "other"},
+      rationale: "<script>unsafe</script> \`\`\`json", decisions: [{decision: "reject", notes: "missing endpoint"}]},
+    {id: "candidate-pending", status: "pending", evidence: [{result: {coverage: 0.9}}]},
+    {id: "candidate-approved", status: "approved", hypothesis: "<b>record</b>"}
+  ];`);
+
+  const markdown = app.run('reviewMarkdown("retail", exportCandidates, [{...state.facts[0], candidate_id: "candidate-approved"}], "2026-10-30T12:00:00Z")');
+
+  assert.match(markdown, /^---\ntitle: "retail review and facts export"/);
+  assert.match(markdown, /Candidates: 3\. Approved facts: 1\./);
+  for (const status of ["pending", "rejected", "approved"]) assert.match(markdown, new RegExp(`Status: ${status}`));
+  assert.match(markdown, /missing endpoint/);
+  assert.match(markdown, /"coverage": 0.9/);
+  assert.match(markdown, /"candidate_id": "candidate-approved"/);
+  assert.match(markdown, /````json\n[\s\S]*````/);
+  assert.match(markdown, /\\<b\\>record\\<\/b\\>/);
+  assert.match(markdown, /"source": "other"/);
+  assert.match(markdown, /Deleted facts and archived records/);
+});
+
+test("empty review export remains a valid Markdown document", () => {
+  const app = harness();
+  const markdown = app.run('reviewMarkdown("retail", [], [], "2026-10-30T12:00:00Z")');
+  assert.match(markdown, /Candidates: 0\. Approved facts: 0\./);
+  assert.match(markdown, /No review candidates/);
+  assert.match(markdown, /No approved facts/);
+});
+
+test("review export ignores filters, captures workspace, and restores button state", async () => {
+  const app = harness();
+  app.run(`
+    globalThis.exportCalls = [];
+    globalThis.exportDownloads = [];
+    globalThis.Blob = class { constructor(parts, options) { this.parts = parts; this.options = options; } };
+    api = async (url) => {
+      exportCalls.push(url);
+      return url.endsWith("/candidates") ? [{id: "rejected", status: "rejected"}] : state.facts;
+    };
+    downloadBlob = (blob, filename) => exportDownloads.push({blob, filename});
+  `);
+  app.get("#review-status").value = "pending";
+  app.get("#review-tier").value = "high";
+
+  await app.run("exportReviewMarkdown()");
+
+  assert.deepEqual(Array.from(app.run("exportCalls")), ["/api/w/retail/candidates", "/api/w/retail/facts"]);
+  assert.equal(app.run("exportDownloads[0].filename"), "retail-review-facts.md");
+  assert.equal(app.run("exportDownloads[0].blob.options.type"), "text/markdown;charset=utf-8");
+  assert.match(app.run("exportDownloads[0].blob.parts[0]"), /Status: rejected/);
+  assert.equal(app.get("#review-export").disabled, false);
+  assert.match(app.errors[0], /Exported 1 candidates and 1 approved facts/);
+});
+
+test("failed review export reports errors without downloading a partial report", async () => {
+  const app = harness();
+  app.run(`
+    globalThis.exportDownloads = [];
+    api = async () => { throw new Error("Access denied"); };
+    downloadBlob = (...args) => exportDownloads.push(args);
+  `);
+
+  await app.run("exportReviewMarkdown()");
+
+  assert.equal(app.run("exportDownloads.length"), 0);
+  assert.match(app.errors[0], /Markdown export failed: Access denied/);
+  assert.equal(app.get("#review-export").disabled, false);
+});
+
+test("workspace switch during review export blocks downloading stale workspace records", async () => {
+  const app = harness();
+  app.run(`
+    globalThis.exportDownloads = [];
+    api = async () => { state.ws = "other"; return []; };
+    downloadBlob = (...args) => exportDownloads.push(args);
+  `);
+
+  await app.run("exportReviewMarkdown()");
+
+  assert.equal(app.run("exportDownloads.length"), 0);
+  assert.match(app.errors[0], /Workspace changed during export/);
+  assert.equal(app.get("#review-export").disabled, false);
+});
+
 test("fact review shows actionable controls and keeps opaque versions in technical details", async () => {
   const app = harness();
 

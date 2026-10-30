@@ -449,6 +449,67 @@ function tierBadge(tier) {
   return h("span", { className: `tier tier-${tier}`, title: `${tier} confidence` }, tier);
 }
 
+function reviewMarkdown(workspace, candidates, facts, exportedAt) {
+  const escape = (value) => String(value ?? "").replace(/[\\`*_{}\[\]()<>#!|~]/g, "\\$&").replace(/\r?\n/g, " ");
+  const records = (items, label) => {
+    if (!items.length) return [`No ${label.toLowerCase()} in this workspace.`, ""];
+    return [...items].sort((a, b) => String(a.id).localeCompare(String(b.id))).flatMap((item) => {
+      const data = JSON.stringify(item, null, 2);
+      // Source notes can contain backticks; the fence must enclose the entire record.
+      const longest = Math.max(0, ...(data.match(/`+/g) || []).map((run) => run.length));
+      const fence = "`".repeat(Math.max(3, longest + 1));
+      return [
+        `### ${escape(item.id)}`, "",
+        `* Status: ${escape(label === "Approved facts" ? "approved" : item.status)}`,
+        `* Kind: ${escape(item.kind)}`,
+        `* Source: ${escape(item.source || item.scope?.source)}`,
+        `* Confidence: ${escape(item.confidence_tier || "not recorded")}`,
+        ...(item.candidate_id ? [`* Candidate: ${escape(item.candidate_id)}`] : []),
+        "", escape(item.hypothesis || ""), "",
+        "Complete record (mapping, rationale, evidence, limitations, provenance, and decision history where recorded):",
+        "", `${fence}json`, data, fence, "",
+      ];
+    });
+  };
+  return [
+    "---",
+    `title: ${JSON.stringify(`${workspace} review and facts export`)}`,
+    "description: All workspace review candidates and active approved facts, including rejected candidates.",
+    `ms.date: ${exportedAt.slice(0, 10)}`,
+    "---", "",
+    "## Export scope", "",
+    `Workspace: ${escape(workspace)}`, "",
+    `Exported at: ${escape(exportedAt)}`, "",
+    `Candidates: ${candidates.length}. Approved facts: ${facts.length}.`, "",
+    "Includes all sources, statuses, and confidence tiers, regardless of the Review tab filters.",
+    "Approved candidates and their promoted facts are separate records linked by candidate ID.",
+    "Deleted facts and archived records are not active workspace facts and are not included.",
+    "This is a read-only export, not an approval or a full-source validation.",
+    "Evidence and notes may contain sensitive values; share only within your authorized data boundary.", "",
+    "## Review candidates", "", ...records(candidates, "Review candidates"),
+    "## Approved facts", "", ...records(facts, "Approved facts"),
+  ].join("\n");
+}
+
+async function exportReviewMarkdown() {
+  const button = $("#review-export");
+  const workspace = state.ws;
+  button.disabled = true;
+  try {
+    if (!workspace) throw new Error("Select a workspace before exporting");
+    const base = `/api/w/${encodeURIComponent(workspace)}`;
+    const [candidates, facts] = await Promise.all([api(`${base}/candidates`), api(`${base}/facts`)]);
+    if (state.ws !== workspace) throw new Error("Workspace changed during export. Export again for the selected workspace.");
+    const content = reviewMarkdown(workspace, candidates, facts, new Date().toISOString());
+    downloadBlob(new Blob([content], { type: "text/markdown;charset=utf-8" }), `${workspace}-review-facts.md`);
+    toast(`Exported ${candidates.length} candidates and ${facts.length} approved facts`);
+  } catch (error) {
+    toast(`Markdown export failed: ${error.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function loadCandidates() {
   const status = $("#review-status").value;
   const tier = $("#review-tier").value;
@@ -664,8 +725,12 @@ function builderCommands(builder) {
 
 async function downloadNotebookPackage(builder, workspace) {
   const blob = await api(`/api/w/${encodeURIComponent(workspace)}/codegen/${encodeURIComponent(builder.builder)}/download`);
+  downloadBlob(blob, builder.builder);
+}
+
+function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
-  const link = h("a", { href: url, download: builder.builder });
+  const link = h("a", { href: url, download: filename });
   document.body.append(link);
   try { link.click(); }
   finally {
@@ -1397,6 +1462,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#run-form").addEventListener("submit", startRun);
   $("#review-status").addEventListener("change", loadCandidates);
   $("#review-refresh").addEventListener("click", loadCandidates);
+  $("#review-export").addEventListener("click", exportReviewMarkdown);
   $("#reviewer").value = localStorage.getItem("ddg-reviewer") || "";
   $("#facts-source").addEventListener("change", loadFacts);
   $("#facts-recheck-btn").addEventListener("click", loadFacts);

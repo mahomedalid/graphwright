@@ -59,6 +59,18 @@ keep their original scope; start a new run to change it. Edges-only discovery ca
 be combined with topology validation, which then produces relationship findings
 only. Profile-only runs cannot use this scope.
 
+### Export review records
+
+In the Review tab, select **Export all facts as Markdown** to download the
+current workspace's candidates and active approved facts across all sources.
+The export includes pending, approved, and rejected candidates regardless of
+status or confidence filters, with mappings, rationale, evidence, limitations,
+provenance, and decision history wherever recorded. Approved candidates and
+their promoted facts remain separate records linked by candidate ID.
+Deleted facts and archived records are excluded. Exporting changes no approvals
+and reads no new source rows. Evidence and notes can contain sensitive values;
+share the downloaded file only within your authorized data boundary.
+
 Relationships without existing endpoint mappings are reported as blocked, not
 silently treated as discovered. Run full discovery or review endpoint mappings
 first. A run with blocked relationships ends with `missing_endpoint_mappings`.
